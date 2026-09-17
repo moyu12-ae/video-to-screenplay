@@ -1,0 +1,31 @@
+{
+  "name": "video-to-screenplay",
+  "owner": {
+    "name": "moyu12-ae",
+    "url": "https://github.com/moyu12-ae"
+  },
+  "metadata": {
+    "description": "Marketplace for the video-to-screenplay plugin: reverse-engineer videos & anime into production-standard 场号制 screenplays.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "video-to-screenplay",
+      "source": "./",
+      "description": "Standalone industrial pipeline that reverse-engineers videos and anime episodes into production-standard Chinese 场号制 screenplays: clean workspace isolation, FFmpeg shot cuts + keyframes, LGSS-style DP semantic scene clustering with an optional McKee sequence layer, and verbatim [[SUB:n]] placeholder splicing for guaranteed dialogue fidelity.",
+      "version": "1.0.0",
+      "keywords": [
+        "video",
+        "screenplay",
+        "reverse-engineering",
+        "ffmpeg",
+        "anime",
+        "subtitles",
+        "scene-detection"
+      ],
+      "license": "MIT",
+      "repository": "https://github.com/moyu12-ae/video-to-screenplay",
+      "homepage": "https://github.com/moyu12-ae/video-to-screenplay"
+    }
+  ]
+}
