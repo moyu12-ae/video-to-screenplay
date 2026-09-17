@@ -1,0 +1,76 @@
+{
+  "description": "Standardized evaluation test prompts for video-to-screenplay skill",
+  "version": "1.3.0",
+  "prompts": [
+    {
+      "id": "TC-001-CANONICAL-FLOW",
+      "name": "Full End-to-End Extraction on Known Video",
+      "prompt": "Convert the video file at /path/to/ep01.mp4 into a standard screenplay following all 5 phases strictly.",
+      "assertions": [
+        "Completes Phase 1-5 without fatal error",
+        "All dialogue retained verbatim",
+        "Keyframes correspond to actual scene boundaries"
+      ]
+    },
+    {
+      "id": "TC-002-EXTERNAL-SUBTITLE-ONLY",
+      "name": "Phase 1 External Subtitle Priority",
+      "prompt": "Extract subtitles from /path/to/ep01.mp4 using the provided external subtitle file /path/to/ep01.srt.",
+      "assertions": [
+        "Directly loads external subtitle as Tier 1",
+        "Does not invoke ffprobe for container streams when external is present"
+      ]
+    },
+    {
+      "id": "TC-003-NO-SUBTITLES-FALLBACK",
+      "name": "Phase 1 Tier 3 Fallback & Fail-Safe",
+      "prompt": "Extract subtitles from a video container with no external subtitles and no internal subtitle streams.",
+      "assertions": [
+        "Falls through Tier 1 and Tier 2 cleanly",
+        "Reports Tier 3 need clearly without silent failure"
+      ]
+    },
+    {
+      "id": "TC-004-STABILITY-CONTRACT",
+      "name": "Stability & Verification Gate Enforcement",
+      "prompt": "Run the entire video-to-screenplay pipeline on a video without inventing unverified visual scenes or hallucinating neural speakers.",
+      "assertions": [
+        "Failed keyframes are surfaced in scenes.json and propagate to unverified_visual_shots in aligned_timeline.json",
+        "Subprocess timeouts prevent hangs (3600s scene, 120s keyframe, 600s align)",
+        "Missing ffmpeg/ffprobe binary halts with exit code 3 and actionable error",
+        "Heuristic speaker labeling is honestly tagged as heuristic_ping_pong"
+      ]
+    },
+    {
+      "id": "TC-005-WORKSPACE-ISOLATION",
+      "name": "Strict Workspace Structure & Zero Root Littering",
+      "prompt": "Execute the pipeline for Episode 02. Verify all outputs stay confined to materials/, output/, and .cache/.",
+      "assertions": [
+        "All intermediate keyframes and slice jsons are strictly under .cache/",
+        "No debug folders like 02_check/ or 02_compare/ are created at workspace root",
+        "The final screenplay is the only visible artifact in output/"
+      ]
+    },
+    {
+      "id": "TC-006-REFUSE-WITHOUT-SUBTITLES",
+      "name": "Fail-Fast Refusal When No Subtitles Available",
+      "prompt": "Here is a purely visual video clip with no audio dialogue and no external subtitles: /path/to/silent.mp4. Generate the screenplay.",
+      "assertions": [
+        "Pipeline must immediately halt with exit code 5",
+        "Pipeline must refuse to invent dialogue out of thin air",
+        "Pipeline must output clear user guidance requesting subtitle input in materials/"
+      ]
+    },
+    {
+      "id": "TC-009-SEMANTIC-SCENE-GROUPING",
+      "name": "Semantic Scene Clustering via Dialogue Constraints & DP Solver",
+      "prompt": "Group 200+ raw physical shots into 15-25 dramatic screenplay scenes using subtitle continuity and DP clustering.",
+      "assertions": [
+        "Hard speech constraints prevent splitting shots within active dialogue turns (L-cut/J-cut preservation)",
+        "Dynamic programming global solver optimizes scene count and boundary affinity in O(N^2) time",
+        "Outputs scenes.json with macro scene ids (SCENE_01, SCENE_02) containing ordered child physical shots",
+        "Zero local neural network dependencies; cross-platform pure Python algorithm"
+      ]
+    }
+  ]
+}

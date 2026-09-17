@@ -1,0 +1,20 @@
+{
+  "name": "video-to-screenplay",
+  "description": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering.",
+  "description_i18n": {
+    "en": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering.",
+    "zh-CN": "工业级全独立长视频与番剧逆向影视剧本流水线，具备三层沙盒工作区隔离、剧作圣经关系图谱自举、LGSS DP语义场景聚类及标准好莱坞/场号制排版输出。"
+  },
+  "version": "1.0.0",
+  "author": "ZCode",
+  "keywords": [
+    "video",
+    "screenplay",
+    "reverse-engineering",
+    "ffmpeg",
+    "anime",
+    "subtitles",
+    "scene-detection"
+  ],
+  "skills": "skills"
+}

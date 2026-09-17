@@ -1,0 +1,8 @@
+*.bak.*
+__pycache__/
+*.pyc
+.mimosa/
+.pytest_cache/
+.v2c/
+.video_agent/
+.zvec-grep/

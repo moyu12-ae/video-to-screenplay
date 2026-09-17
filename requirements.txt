@@ -1,0 +1,11 @@
+# Core runtime dependencies for video-to-screenplay
+# The deterministic pipeline is pure Python standard library.
+# numpy + opencv-python-headless (pre-compiled wheels, zero models) are OPTIONAL:
+# they enable the HSV keyframe-palette "place" affinity in semantic_scene_grouper.py.
+# Without them the grouper gracefully degrades to dialogue/silence heuristics.
+
+numpy>=1.22.0
+opencv-python-headless>=4.8.0
+
+# Development only (not needed at runtime):
+# pytest>=8.0
