@@ -1,5 +1,7 @@
 # Video to Screenplay (`video-to-screenplay`)
 
+English | [简体中文](README_CN.md)
+
 A ZCode plugin that reverse-engineers videos and anime episodes into production-standard Asian 场号制 screenplays. Deterministic Python stages compute everything measurable (cuts, timecodes, dialogue alignment); scene understanding (place, time of day, characters, staging) is supplied by one general multimodal LLM — the agent itself. No specialized models, no torch, no acoustic tooling.
 
 ## How It Works
@@ -49,7 +51,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "<Title>"
 python3 -m pytest tests/ -q
 ```
 
-See [SKILL.md](skills/video-to-screenplay/SKILL.md) for the full agent workflow, the scene-writing contract, and the failure-mode matrix. Chinese overview: [README_CN.md](README_CN.md).
+See [SKILL.md](skills/video-to-screenplay/SKILL.md) for the full agent workflow, the scene-writing contract, and the failure-mode matrix.
 
 ## License
 
