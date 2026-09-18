@@ -78,3 +78,23 @@
   `diarization_source{}` are additive. `align_timeline.py`'s fallback lookup upgraded
   first-match → max-overlap (bleeding subtitle lines no longer inherit a neighbour's speaker).
   The legacy dash-alternation/text-syntax per-line attribution was removed.
+
+## 6. v0.3.1 — Cross-Part Identity Reconciliation
+
+- **Trigger (v0.3.0 live test on real anime)**: diarization labels are PART-LOCAL namespaces;
+  merging by label string alone wrongly unified two different people (part0's "Speaker 2" = an
+  advisor, part1's "Speaker 2" = a teammate) into one cluster. Wrong attribution cannot be
+  self-healed downstream; over-splitting can (the scene pass names clusters from context).
+- **Fix**:
+  | Aspect | v0.3.0 | v0.3.1 |
+  | :--- | :--- | :--- |
+  | **Cut points** | fixed intervals | snapped to silence midpoints (±5 s) so parts break between turns |
+  | **Overlap** | none | adjacent parts share ±3 s of audio |
+  | **Cross-part identity** | same raw label = same cluster (WRONG) | union-find over co-occurrence evidence: turns from different parts overlap ≥50 % of the shorter → same voice; no evidence → no merge |
+  | **Re-splitting** | hand-edit the workorder | `prepare --chunk-seconds 30~40` (retry path for MCP call timeouts) |
+- **Live acceptance (ep3 segment, 0–83 s, 2/4 parts upstream-healthy)**: the v0.3.0 wrong pair
+  stayed separate (advisor ≠ teammate), and one character speaking across parts was linked into
+  a single cluster via overlap-zone co-occurrence.
+- **Known residual (v0.3.2 candidate)**: subtitles leading the audio by ~2 s can steal a line's
+  max-overlap binding at speaker transitions; a global subtitle↔audio offset estimate is the
+  likely fix.

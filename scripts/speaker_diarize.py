@@ -54,6 +54,11 @@ FFPROBE_TIMEOUT_SEC = 120.0
 CHUNK_THRESHOLD_SEC = 3000.0   # 50 min: beyond this, split
 CHUNK_TARGET_SEC = 2700.0      # 45 min per part
 CHUNK_MERGE_TAIL_SEC = 600.0   # tails shorter than this fold into the previous part
+CHUNK_OVERLAP_SEC = 3.0        # adjacent parts share ±3s so merge can link identities
+SILENCE_SNAP_TOLERANCE_SEC = 5.0
+SILENCE_DETECT_NOISE = "-30dB"
+SILENCE_DETECT_MIN_D = "0.3"
+COOCCUR_MIN_RATIO = 0.5        # cross-part turns overlapping ≥50% of the shorter = same voice
 
 EXIT_OK = 0
 EXIT_BAD_INPUT = 1
@@ -123,24 +128,105 @@ def probe_has_audio(path: str) -> bool:
     return bool(_ffprobe(["-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", path]))
 
 
-def plan_parts(duration_ms: int) -> List[Tuple[int, int]]:
-    """Split [0, duration_ms] into parts of <= CHUNK_TARGET_SEC, folding a short
-    tail into the previous part. Pure function; deterministic."""
+def plan_boundaries(duration_ms: int, chunk_target_sec: Optional[float] = None) -> List[float]:
+    """Interior cut points (seconds) at fixed target intervals; a short tail folds
+    back. Empty list = single part. Pure function; deterministic."""
+    target = float(chunk_target_sec) if chunk_target_sec else CHUNK_TARGET_SEC
     duration_s = duration_ms / 1000.0
-    if duration_s <= CHUNK_THRESHOLD_SEC:
-        return [(0, int(duration_ms))]
-    raw: List[Tuple[int, int]] = []
-    start = 0.0
-    while start < duration_s - 1e-6:
-        end = min(start + CHUNK_TARGET_SEC, duration_s)
-        raw.append((int(start * 1000), int(end * 1000)))
-        start = end
-    if len(raw) >= 2:
-        last_start, last_end = raw[-1]
-        if (last_end - last_start) / 1000.0 < CHUNK_MERGE_TAIL_SEC:
-            prev_start = raw[-2][0]
-            raw = raw[:-2] + [(prev_start, last_end)]
-    return raw
+    threshold = CHUNK_THRESHOLD_SEC if chunk_target_sec is None else target
+    if duration_s <= max(threshold, target):
+        return []
+    boundaries: List[float] = []
+    b = target
+    while b < duration_s - 1e-6:
+        boundaries.append(b)
+        b += target
+    if boundaries:
+        fold = min(CHUNK_MERGE_TAIL_SEC, target / 2.0)
+        if duration_s - boundaries[-1] < fold:
+            boundaries.pop()
+    return boundaries
+
+
+def snap_boundaries(boundaries: List[float], silence_points: List[float],
+                    tolerance: float = SILENCE_SNAP_TOLERANCE_SEC) -> List[float]:
+    """Snap each boundary to the nearest unused silence midpoint within tolerance
+    so parts break between speaker turns, never mid-utterance."""
+    snapped: List[float] = []
+    used: set = set()
+    for b in boundaries:
+        best_i, best_d = None, tolerance
+        for i, s in enumerate(silence_points):
+            d = abs(s - b)
+            if d <= best_d and i not in used:
+                best_i, best_d = i, d
+        if best_i is not None:
+            used.add(best_i)
+            snapped.append(round(float(silence_points[best_i]), 3))
+        else:
+            snapped.append(round(float(b), 3))
+    return sorted(snapped)
+
+
+def parts_from_boundaries(duration_ms: int, boundaries: List[float],
+                          overlap_sec: float = CHUNK_OVERLAP_SEC) -> List[Tuple[int, int]]:
+    """Parts between cut points; adjacent parts share ±overlap_sec so merge can
+    link identities by utterance co-occurrence. Pure; deterministic."""
+    duration_ms = int(duration_ms)
+    ov = int(overlap_sec * 1000)
+    cuts = [0] + [max(0, min(int(b * 1000), duration_ms)) for b in sorted(boundaries)] + [duration_ms]
+    cuts = [c for i, c in enumerate(cuts) if i == 0 or c > cuts[i - 1]]
+    parts: List[Tuple[int, int]] = []
+    for i in range(len(cuts) - 1):
+        start = 0 if i == 0 else max(0, cuts[i] - ov)
+        end = duration_ms if i == len(cuts) - 2 else min(duration_ms, cuts[i + 1] + ov)
+        if end - start > 0:
+            parts.append((start, end))
+    return parts
+
+
+def plan_parts(duration_ms: int, chunk_target_sec: Optional[float] = None,
+               silence_points: Optional[List[float]] = None) -> List[Tuple[int, int]]:
+    """Full plan: boundaries -> (optional) silence snapping -> overlap-aware parts.
+    Single part when no boundaries survive (<=50 min by default, <= target with an
+    explicit --chunk-seconds, or after tail folding)."""
+    boundaries = plan_boundaries(duration_ms, chunk_target_sec)
+    if boundaries and silence_points:
+        boundaries = snap_boundaries(boundaries, silence_points)
+    return parts_from_boundaries(duration_ms, boundaries)
+
+
+def parse_silences(log_text: str) -> List[float]:
+    """Parse ffmpeg silencedetect stderr into silence midpoints (seconds)."""
+    midpoints: List[float] = []
+    start = None
+    for line in log_text.splitlines():
+        m = re.search(r"silence_start:\s*([0-9.]+)", line)
+        if m:
+            start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*([0-9.]+)", line)
+        if m and start is not None:
+            end = float(m.group(1))
+            if end > start:
+                midpoints.append((start + end) / 2.0)
+            start = None
+    return midpoints
+
+
+def detect_silence_midpoints(audio_path: str) -> List[float]:
+    """Silence midpoints of the extracted source audio; part boundaries prefer
+    these so a split never lands mid-utterance."""
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", audio_path,
+           "-af", f"silencedetect=noise={SILENCE_DETECT_NOISE}:d={SILENCE_DETECT_MIN_D}",
+           "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              timeout=AUDIO_EXTRACT_TIMEOUT_SEC, check=False)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("[WARN] silencedetect timed out; boundaries stay unsnapped\n")
+        return []
+    return parse_silences((proc.stderr or b"").decode("utf-8", "replace"))
 
 
 def extract_audio_part(video: str, out_path: str, start_ms: int, end_ms: int) -> None:
@@ -165,6 +251,30 @@ def extract_audio_part(video: str, out_path: str, start_ms: int, end_ms: int) ->
         sys.exit(EXIT_EXTRACT_FAILED)
 
 
+def slice_audio_part(full_audio: str, out_path: str, start_ms: int, end_ms: int) -> None:
+    """Cut a part out of the extracted source audio (stream copy; AAC frame
+    precision ~20ms is far below the ±3s overlap budget)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{start_ms / 1000.0:.3f}", "-i", full_audio,
+        "-t", f"{(end_ms - start_ms) / 1000.0:.3f}",
+        "-c", "copy", "-y", out_path,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=AUDIO_EXTRACT_TIMEOUT_SEC, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[FATAL] ffmpeg audio slice timed out for {out_path}\n")
+        sys.exit(EXIT_EXTRACT_FAILED)
+    if proc.returncode != 0 or not os.path.isfile(out_path):
+        err = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        tail = err[-1] if err else "unknown ffmpeg error"
+        sys.stderr.write(f"[FATAL] ffmpeg failed to slice {out_path}: {tail}\n")
+        sys.exit(EXIT_EXTRACT_FAILED)
+
+
 def locate_video(ws: Optional[str], override: Optional[str]) -> Optional[str]:
     if override:
         return override if os.path.isfile(override) else None
@@ -179,7 +289,8 @@ def locate_video(ws: Optional[str], override: Optional[str]) -> Optional[str]:
 
 def make_workorder(video_path: str, duration_ms: Optional[int], parts: List[Tuple[int, int]],
                    num_speakers: Optional[int], language: Optional[str],
-                   no_audio: bool) -> Dict[str, Any]:
+                   no_audio: bool, chunk_target_sec: Optional[float] = None,
+                   boundaries: Optional[List[float]] = None) -> Dict[str, Any]:
     audio_dir = "audio"
     part_entries: List[Dict[str, Any]] = []
     if not no_audio:
@@ -199,6 +310,12 @@ def make_workorder(video_path: str, duration_ms: Optional[int], parts: List[Tupl
         "mcp_tool": MCP_TOOL_NAME,
         "num_speakers_hint": num_speakers,
         "language_hint": language,
+        "chunking": {
+            "requested_chunk_sec": chunk_target_sec,
+            "boundaries_sec": [round(b, 3) for b in (boundaries or [])],
+            "overlap_ms": int(CHUNK_OVERLAP_SEC * 1000),
+            "boundary_snap": "silence midpoint ±5s via ffmpeg silencedetect",
+        },
         "expected_segment_schema": {"speaker": "<label>", "start": 0.0, "end": 0.0, "text": "<text>"},
         "parts": part_entries,
         "note": (
@@ -214,7 +331,7 @@ def make_workorder(video_path: str, duration_ms: Optional[int], parts: List[Tupl
 
 
 def cmd_prepare(ws: Optional[str], video_override: Optional[str], num_speakers: Optional[int],
-                language: Optional[str]) -> None:
+                language: Optional[str], chunk_target_sec: Optional[float] = None) -> None:
     require_binaries()
     video = locate_video(ws, video_override)
     if not video:
@@ -229,21 +346,35 @@ def cmd_prepare(ws: Optional[str], video_override: Optional[str], num_speakers: 
 
     audio_dir = Path(ws, ".cache", "audio") if ws else Path(".cache", "audio")
     os.makedirs(audio_dir, exist_ok=True)
+    full_audio = (audio_dir / "source_audio.m4a").resolve()
+    if ws:
+        try:
+            full_audio.relative_to(Path(ws).resolve())
+        except ValueError:
+            sys.stderr.write(f"[FATAL] Audio path escaped the workspace containment: {full_audio}\n")
+            sys.exit(2)
 
-    parts = plan_parts(duration_ms)
-    work = make_workorder(video, duration_ms, parts, num_speakers, language, no_audio=not has_audio)
-
+    boundaries: List[float] = []
     if has_audio:
+        extract_audio_part(video, str(full_audio), 0, duration_ms)
+        boundaries = plan_boundaries(duration_ms, chunk_target_sec)
+        if boundaries:
+            boundaries = snap_boundaries(boundaries, detect_silence_midpoints(str(full_audio)))
+    parts = parts_from_boundaries(duration_ms, boundaries)
+    work = make_workorder(video, duration_ms, parts, num_speakers, language,
+                          no_audio=not has_audio, chunk_target_sec=chunk_target_sec,
+                          boundaries=boundaries)
+
+    if has_audio and len(parts) > 1:
         for i, (s, e) in enumerate(parts):
-            suffix = "" if len(parts) == 1 else f".part{i:03d}"
-            out_path = (audio_dir / f"source_audio{suffix}.m4a").resolve()
+            out_path = (audio_dir / f"source_audio.part{i:03d}.m4a").resolve()
             if ws:
                 try:
                     out_path.relative_to(Path(ws).resolve())
                 except ValueError:
                     sys.stderr.write(f"[FATAL] Audio part path escaped the workspace containment: {out_path}\n")
                     sys.exit(2)
-            extract_audio_part(video, str(out_path), s, e)
+            slice_audio_part(str(full_audio), str(out_path), s, e)
 
     workorder_path = (audio_dir / "diarize_workorder.json").resolve()
     if ws:
@@ -315,15 +446,54 @@ def normalize_omni_segments(data: Dict[str, Any], offset_ms: int) -> List[Dict[s
     return turns
 
 
-def assign_cluster_labels(turns: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Map raw Omni labels to stable provisional labels in first-appearance
-    (temporal) order: SPEAKER_A1, SPEAKER_A2, ... (matches ^SPEAKER_[A-Z0-9]+$)."""
-    label_map: Dict[str, str] = {}
+def build_cluster_map(turns: List[Dict[str, Any]]) -> Dict[Tuple[int, str], str]:
+    """Link (part, raw_label) nodes into acoustic identities.
+
+    Diarization labels are PART-LOCAL namespaces: "Speaker 2" in part 0 and in
+    part 1 may be different people. The only trusted merge evidence is a shared
+    utterance — turns from DIFFERENT parts whose absolute-time intervals overlap
+    >= COOCCUR_MIN_RATIO of the shorter segment (both parts diarized the same
+    audio inside the +-overlap window). Nodes without evidence stay separate:
+    over-splitting is safe (the scene pass names clusters from context), wrong
+    merging is not. Deterministic; union-find with transitive closure."""
+    nodes = sorted({(t["part"], t["raw_label"]) for t in turns})
+    parent: Dict[Tuple[int, str], Tuple[int, str]] = {n: n for n in nodes}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    by_node: Dict[Tuple[int, str], List[Dict[str, Any]]] = {}
     for t in turns:
-        raw = t["raw_label"]
-        if raw not in label_map:
-            label_map[raw] = f"SPEAKER_A{len(label_map) + 1}"
-    return label_map
+        by_node.setdefault((t["part"], t["raw_label"]), []).append(t)
+
+    node_list = sorted(by_node)
+    for i, na in enumerate(node_list):
+        for nb in node_list[i + 1:]:
+            if nb[0] == na[0]:
+                continue  # same part: one node per raw label already
+            linked = False
+            for x in by_node[na]:
+                for y in by_node[nb]:
+                    ov = _overlap_ms(x["start_ms"], x["end_ms"], y["start_ms"], y["end_ms"])
+                    shorter = max(1, min(x["end_ms"] - x["start_ms"], y["end_ms"] - y["start_ms"]))
+                    if ov / shorter >= COOCCUR_MIN_RATIO:
+                        ra, rb = find(na), find(nb)
+                        if ra != rb:
+                            parent[rb] = ra
+                        linked = True
+                        break
+                if linked:
+                    break
+
+    comp_label: Dict[Tuple[int, str], str] = {}
+    for t in sorted(turns, key=lambda t: (t["start_ms"], t["end_ms"], t["raw_label"])):
+        root = find((t["part"], t["raw_label"]))
+        if root not in comp_label:
+            comp_label[root] = f"SPEAKER_A{len(comp_label) + 1}"
+    return {n: comp_label[find(n)] for n in nodes}
 
 
 def _norm_text(text: str) -> str:
@@ -341,10 +511,11 @@ def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
-def bind_lines(items: List[Dict[str, Any]], turns: List[Dict[str, Any]],
-               label_map: Dict[str, str]) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
-    """Bind each subtitle line to the max-overlap voice cluster. Returns
-    (segments rows, cluster_id -> contributing line dicts)."""
+def bind_lines(items: List[Dict[str, Any]],
+               turns: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+    """Bind each subtitle line to the max-overlap voice cluster (turns carry
+    their cluster_id from build_cluster_map). Returns (segments rows,
+    cluster_id -> contributing line dicts)."""
     rows: List[Dict[str, Any]] = []
     cluster_lines: Dict[str, List[Dict[str, Any]]] = {}
     for i, item in enumerate(items):
@@ -376,15 +547,15 @@ def bind_lines(items: List[Dict[str, Any]], turns: List[Dict[str, Any]],
             continue
 
         turn = best["turn"]
-        cluster_id = label_map[turn["raw_label"]]
+        cluster_id = turn["cluster_id"]
         ratio = best["ratio"]
         confidence = CONF_HIGH if ratio >= CONF_HIGH_RATIO else (
             CONF_MID if ratio >= CONF_MID_RATIO else CONF_LOW)
 
         secondary = None
-        if second is not None and second["turn"]["raw_label"] != turn["raw_label"] \
+        if second is not None and second["turn"]["cluster_id"] != cluster_id \
                 and second["ratio"] >= SECONDARY_MIN_RATIO:
-            secondary = label_map[second["turn"]["raw_label"]]
+            secondary = second["turn"]["cluster_id"]
 
         rows.append({
             "segment_id": i + 1, "start_ms": start, "end_ms": end,
@@ -424,7 +595,7 @@ def name_clusters(cluster_lines: Dict[str, List[Dict[str, Any]]]) -> Tuple[Dict[
 
 def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[str, Any]],
                  cluster_lines: Dict[str, List[Dict[str, Any]]], turns: List[Dict[str, Any]],
-                 label_map: Dict[str, str], names: Dict[str, Optional[str]],
+                 names: Dict[str, Optional[str]],
                  manifest: Dict[str, int], parts_used: List[str],
                  empty_reason: Optional[str] = None) -> Dict[str, Any]:
     named_rows = []
@@ -435,6 +606,9 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
             row["speaker"] = name if name else row["cluster_id"]
         named_rows.append(row)
 
+    cluster_parts: Dict[str, set] = {}
+    for t in turns:
+        cluster_parts.setdefault(t["cluster_id"], set()).add(t.get("part_file"))
     clusters = []
     for cluster_id in sorted(cluster_lines.keys(), key=lambda c: int(c.rsplit("A", 1)[1])):
         lines = cluster_lines[cluster_id]
@@ -443,6 +617,7 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
             "name": names.get(cluster_id),
             "line_count": len(lines),
             "speech_ms": sum(int(l.get("end_ms", 0)) - int(l.get("start_ms", 0)) for l in lines),
+            "parts": sorted(cluster_parts.get(cluster_id, set())),
         })
 
     unattributed = sum(1 for r in named_rows if r["speaker"] is None)
@@ -463,8 +638,9 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
         "clusters": clusters,
         "speech_turns": [
             {
-                "cluster_id": label_map[t["raw_label"]],
+                "cluster_id": t["cluster_id"],
                 "raw_label": t["raw_label"],
+                "part": t.get("part_file"),
                 "start_ms": t["start_ms"], "end_ms": t["end_ms"],
                 "omni_transcript": t["text"],
             }
@@ -483,12 +659,13 @@ def _empty_output(video_name: str, items: List[Dict[str, Any]], reason: str) -> 
         "method": "unattributed_diarization_unavailable",
         "cluster_id": None, "secondary_speaker": None, "text_agreement": None,
     } for i, it in enumerate(items)]
-    return build_output(video_name, items, rows, {}, [], {}, {}, {}, [], empty_reason=reason)
+    return build_output(video_name, items, rows, {}, [], {}, {}, [], empty_reason=reason)
 
 
 def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Collect the saved Omni outputs per the workorder (or a legacy single
-    omni_diarized.json). Exit 7 naming the missing/invalid files."""
+    omni_diarized.json), tag turns with their part, and link cross-part
+    identities via build_cluster_map. Exit 7 naming missing/invalid files."""
     audio_dir = Path(ws, ".cache", "audio") if ws else Path(".cache", "audio")
     workorder_path = (audio_dir / "diarize_workorder.json").resolve()
     if ws:
@@ -516,9 +693,9 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
         expectations.append(("omni_diarized.json", 0))
 
     used: List[str] = []
-    blocks: List[Dict[str, Any]] = []
+    turns: List[Dict[str, Any]] = []
     missing: List[str] = []
-    for fname, offset in expectations:
+    for idx, (fname, offset) in enumerate(expectations):
         path = (audio_dir / fname).resolve()
         if ws:
             try:
@@ -526,7 +703,7 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
             except ValueError:
                 sys.stderr.write(f"[FATAL] Omni output path escaped the workspace containment: {path}\n")
                 sys.exit(2)
-        if not os.path.isfile(path):
+        if not path.is_file():
             missing.append(fname)
             continue
         try:
@@ -535,13 +712,16 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
         except Exception as e:
             sys.stderr.write(f"[FATAL] Omni output {path} is not valid JSON: {e}\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
-        turns = normalize_omni_segments(data, offset)
-        if not turns:
+        part_turns = normalize_omni_segments(data, offset)
+        if not part_turns:
             sys.stderr.write(f"[FATAL] Omni output {path} contains no usable segments "
                              f"(expected {{'segments': [{{speaker,start,end,text}}]}})\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+        for t in part_turns:
+            t["part"] = idx
+            t["part_file"] = fname
         used.append(fname)
-        blocks.append({"turns": turns})
+        turns.extend(part_turns)
     if missing:
         sys.stderr.write("[FATAL] Missing Omni output(s) for: "
                          f"{', '.join(missing)}\n"
@@ -549,8 +729,10 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
                          "block verbatim, then rerun `merge`.\n")
         sys.exit(EXIT_OMNI_OUTPUT_INVALID)
 
-    turns = [t for b in blocks for t in b["turns"]]
     turns.sort(key=lambda t: (t["start_ms"], t["end_ms"], t["raw_label"]))
+    cluster_map = build_cluster_map(turns) if turns else {}
+    for t in turns:
+        t["cluster_id"] = cluster_map[(t["part"], t["raw_label"])]
     return used, turns
 
 
@@ -578,21 +760,20 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
         return
 
     parts_used, turns = load_omni_parts(ws)
-    label_map = assign_cluster_labels(turns)
-    rows, cluster_lines = bind_lines(items, turns, label_map)
+    rows, cluster_lines = bind_lines(items, turns)
 
     if not turns:
         sys.stderr.write("[WARN] Diarization produced zero speech turns; all speakers null "
                          "(check the audio track / subtitle tier)\n")
         sys.stdout.write(json.dumps(
-            build_output(video_name, items, rows, {}, [], {}, {}, {}, parts_used,
+            build_output(video_name, items, rows, {}, [], {}, {}, parts_used,
                          empty_reason="omni_returned_no_speech"),
             ensure_ascii=False, indent=2) + "\n")
         return
 
     names, manifest = name_clusters(cluster_lines)
     sys.stdout.write(json.dumps(
-        build_output(video_name, items, rows, cluster_lines, turns, label_map,
+        build_output(video_name, items, rows, cluster_lines, turns,
                      names, manifest, parts_used),
         ensure_ascii=False, indent=2) + "\n")
 
@@ -612,6 +793,9 @@ def main() -> None:
     parser.add_argument("--num-speakers", type=int, default=None,
                         help="Optional diarization hint, only when the cast size is known")
     parser.add_argument("--language", default=None, help="Optional spoken-language hint (zh/en/ja/...)")
+    parser.add_argument("--chunk-seconds", type=float, default=None,
+                        help="prepare: target part length in seconds (silence-aligned, ±3s "
+                             "overlap); use ~30-40 when single-part MCP calls time out")
     parser.add_argument("--empty-fallback", action="store_true",
                         help="merge only: emit all-null speakers.json (MCP unavailable / no audio)")
     args = parser.parse_args()
@@ -621,7 +805,7 @@ def main() -> None:
     video_name = os.path.basename(video) if video else "video_input"
 
     if args.action == "prepare":
-        cmd_prepare(ws, args.video, args.num_speakers, args.language)
+        cmd_prepare(ws, args.video, args.num_speakers, args.language, args.chunk_seconds)
     elif args.action == "merge":
         cmd_merge(ws, args.subtitles, video_name, args.empty_fallback)
     else:

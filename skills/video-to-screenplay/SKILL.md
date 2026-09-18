@@ -92,7 +92,7 @@ wait $PID_VISUAL
 ```
 
 - `scene_detect.py` 把镜头 JSON 打印到 **stdout**（纯过滤器；按示例重定向）。缺 FFmpeg → 退出码 3。
-- `speaker_diarize.py prepare` 用 ffmpeg 抽 16k 单声道音频（>50 分钟自动切 ≤45 分钟分片），写 `diarize_workorder.json` 后**退出码 6**——等待你完成 MCP 调用。无音频流的工作单 `status=no_audio_stream`。
+- `speaker_diarize.py prepare` 用 ffmpeg 抽 16k 单声道音频；多分片时切点**吸附静音点**（silencedetect，±5s 容差）、相邻分片**重叠 ±3 秒**（merge 据此跨片对齐身份）；默认 >50 分钟自动分片，单次 MCP 调用超时/失败时用 `prepare --chunk-seconds 30~40` 重切重试。写 `diarize_workorder.json` 后**退出码 6**——等待你完成 MCP 调用。无音频流的工作单 `status=no_audio_stream`。
 
 **声学分离（你的 MCP 步骤）**：对工作单 `parts[]` 的每一片调用 MCP 工具
 `omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：
@@ -104,7 +104,7 @@ wait $PID_VISUAL
 python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
 ```
 
-- `merge` 确定性执行：分片时间偏移还原 → 每条字幕按**最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
+- `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ 每条字幕按**最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
 - 未配置 qwen-mm-plugins / 无 DASHSCOPE_API_KEY / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
 
 🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空；`speakers.json` 已产出（声学合并或 `--empty-fallback` 皆可）。
@@ -172,6 +172,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 完全没有字幕 | probe 为空 + 用户确认 | 硬性拒绝，退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
 | qwen-mm-plugins 未安装 / 无 DASHSCOPE_API_KEY | prepare（退出码 6）后无法调用 MCP | `merge --empty-fallback`：speakers.json 全 null + WARN，流水线继续，说话人列留空 |
 | Omni 输出缺失/非法/分片不全 | merge **退出码 7** 并点名文件 | 按 `diarize_workorder.json` 补做对应分片的 MCP 调用后重跑 `merge` |
+| 单次 MCP 调用超时/失败（长音频、客户端执行窗口、上游波动） | 工具执行超时或连接中断 | `prepare --chunk-seconds 30~40` 重切后逐片重调（上游不稳时等待 1–3 分钟再试） |
 | 视频无音频流 | 工作单 `status=no_audio_stream` | 直接 `merge --empty-fallback`；对白只存在于字幕层，流水线不受影响 |
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |

@@ -22,12 +22,14 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from subtitle_extractor import extract_speaker_from_text
 from speaker_diarize import (
-    assign_cluster_labels,
     bind_lines,
+    build_cluster_map,
     is_provisional_label,
     name_clusters,
     normalize_omni_segments,
+    parse_silences,
     plan_parts,
+    snap_boundaries,
 )
 from align_timeline import infer_av_relationship
 
@@ -68,11 +70,35 @@ class TestOmniSpeakerMerge(unittest.TestCase):
         self.assertEqual(plan_parts(1_440_000), [(0, 1_440_000)])
 
     def test_plan_parts_long_video_chunks_at_45min(self):
-        """130 min -> 45 + 45 + 40 (tail 40 min >= 10 min stays its own part)."""
+        """130 min -> boundaries at 45/90 min; adjacent parts share a ±3s overlap."""
         self.assertEqual(
             plan_parts(7_800_000),
-            [(0, 2_700_000), (2_700_000, 5_400_000), (5_400_000, 7_800_000)],
+            [(0, 2_703_000), (2_697_000, 5_403_000), (5_397_000, 7_800_000)],
         )
+
+    def test_plan_parts_chunk_seconds_with_overlap(self):
+        """--chunk-seconds 40 on 148s -> 4 parts, adjacent sharing ±3s."""
+        self.assertEqual(
+            plan_parts(148_000, chunk_target_sec=40),
+            [(0, 43_000), (37_000, 83_000), (77_000, 123_000), (117_000, 148_000)],
+        )
+
+    def test_plan_parts_snaps_boundaries_to_silence(self):
+        self.assertEqual(
+            plan_parts(148_000, chunk_target_sec=40, silence_points=[39.2, 79.4, 121.4]),
+            [(0, 42_200), (36_200, 82_400), (76_400, 124_400), (118_400, 148_000)],
+        )
+
+    def test_parse_silences_uses_midpoints(self):
+        log = ("[silencedetect @ 0x1] silence_start: 12.345\n"
+               "[silencedetect @ 0x1] silence_end: 13.456 | silence_duration: 1.111\n"
+               "[silencedetect @ 0x1] silence_start: 40.1\n")  # open at EOF -> ignored
+        self.assertAlmostEqual(parse_silences(log)[0], 12.9005)
+        self.assertEqual(len(parse_silences(log)), 1)
+
+    def test_snap_boundaries_nearest_unused_silence(self):
+        self.assertEqual(snap_boundaries([40.0, 80.0], [39.2, 79.6, 120.9]), [39.2, 79.6])
+        self.assertEqual(snap_boundaries([40.0], [100.0]), [40.0])  # out of tolerance
 
     def test_plan_parts_folds_short_tail(self):
         """53.3 min -> 45-min part + an 8.3-min tail that folds back into it."""
@@ -91,23 +117,48 @@ class TestOmniSpeakerMerge(unittest.TestCase):
         self.assertEqual(turns[0]["end_ms"], 2_702_500)
         self.assertEqual(turns[0]["text"], "你好")
 
-    def test_cluster_labels_follow_temporal_first_appearance(self):
-        turns = normalize_omni_segments({"segments": [
-            {"speaker": "Speaker 2", "start": 0.0, "end": 1.0},
-            {"speaker": "Speaker 1", "start": 2.0, "end": 3.0},
-            {"speaker": "Speaker 2", "start": 4.0, "end": 5.0},
-        ]}, offset_ms=0)
-        self.assertEqual(assign_cluster_labels(turns),
-                         {"Speaker 2": "SPEAKER_A1", "Speaker 1": "SPEAKER_A2"})
+    def _pturn(self, part, label, start, end, text=""):
+        return {"part": part, "raw_label": label, "start_ms": start, "end_ms": end, "text": text}
 
-    def _turn(self, label, start, end):
-        return {"raw_label": label, "start_ms": start, "end_ms": end, "text": ""}
+    def test_cluster_map_links_shared_utterance_across_parts(self):
+        turns = [self._pturn(0, "Speaker 1", 27_200, 39_500),
+                 self._pturn(1, "Speaker 1", 40_880, 43_040)]
+        merged = build_cluster_map(turns)
+        self.assertNotEqual(merged[(0, "Speaker 1")], merged[(1, "Speaker 1")])
+        # same utterance diarized by both parts inside the ±3s overlap -> linked
+        turns.append(self._pturn(1, "Speaker 1", 38_000, 39_400))
+        merged = build_cluster_map(turns)
+        self.assertEqual(merged[(0, "Speaker 1")], merged[(1, "Speaker 1")])
+
+    def test_cluster_map_ep3_regression_same_label_different_people(self):
+        """v0.3.0 bug: part0's Speaker 2 (advisor) and part1's Speaker 2 (Nagahama)
+        were merged by label string alone. Without co-occurrence evidence they
+        must stay separate clusters."""
+        turns = [self._pturn(0, "Speaker 2", 3_920, 25_040),
+                 self._pturn(1, "Speaker 2", 53_000, 57_000),
+                 self._pturn(0, "Speaker 1", 38_400, 39_520),
+                 self._pturn(1, "Speaker 1", 40_880, 43_040)]
+        merged = build_cluster_map(turns)
+        self.assertNotEqual(merged[(0, "Speaker 2")], merged[(1, "Speaker 2")])
+        self.assertNotEqual(merged[(0, "Speaker 1")], merged[(1, "Speaker 1")])
+
+    def test_cluster_map_transitive_link_and_temporal_order(self):
+        turns = [self._pturn(0, "A", 38_000, 39_500),
+                 self._pturn(1, "B", 38_800, 39_600),    # co-occurs with part0
+                 self._pturn(1, "B", 50_000, 52_000),
+                 self._pturn(2, "C", 51_500, 52_500)]    # co-occurs with part1's later turn
+        merged = build_cluster_map(turns)
+        self.assertEqual(merged[(0, "A")], merged[(1, "B")])
+        self.assertEqual(merged[(1, "B")], merged[(2, "C")])
+        self.assertEqual(merged[(0, "A")], "SPEAKER_A1")  # earliest component wins A1
+
+    def _turn(self, label, start, end, text=""):
+        return {"raw_label": label, "cluster_id": label, "start_ms": start,
+                "end_ms": end, "text": text}
 
     def test_bind_lines_picks_max_overlap_primary(self):
-        turns = [self._turn("A", 0, 2000), self._turn("B", 2000, 4000)]
-        label_map = {"A": "SPEAKER_A1", "B": "SPEAKER_A2"}
-        rows, _ = bind_lines([{"text": "喂？", "start_ms": 1500, "end_ms": 3500}],
-                             turns, label_map)
+        turns = [self._turn("SPEAKER_A1", 0, 2000), self._turn("SPEAKER_A2", 2000, 4000)]
+        rows, _ = bind_lines([{"text": "喂？", "start_ms": 1500, "end_ms": 3500}], turns)
         row = rows[0]
         self.assertEqual(row["cluster_id"], "SPEAKER_A2")   # 1500ms vs 500ms overlap
         self.assertEqual(row["confidence"], 0.75)           # ratio 0.75 -> mid tier
@@ -115,10 +166,8 @@ class TestOmniSpeakerMerge(unittest.TestCase):
         self.assertEqual(row["method"], "acoustic_diarization")
 
     def test_bind_lines_secondary_speaker_on_heavy_overlap(self):
-        turns = [self._turn("A", 0, 1400), self._turn("B", 1400, 2400)]
-        label_map = {"A": "SPEAKER_A1", "B": "SPEAKER_A2"}
-        rows, _ = bind_lines([{"text": " overlapping!", "start_ms": 1000, "end_ms": 2000}],
-                             turns, label_map)
+        turns = [self._turn("SPEAKER_A1", 0, 1400), self._turn("SPEAKER_A2", 1400, 2400)]
+        rows, _ = bind_lines([{"text": " overlapping!", "start_ms": 1000, "end_ms": 2000}], turns)
         self.assertEqual(rows[0]["cluster_id"], "SPEAKER_A2")      # 600ms
         self.assertEqual(rows[0]["secondary_speaker"], "SPEAKER_A1")  # 400ms = 0.4
         self.assertEqual(rows[0]["confidence"], 0.75)
@@ -126,30 +175,27 @@ class TestOmniSpeakerMerge(unittest.TestCase):
     def test_bind_lines_no_overlap_is_unattributed(self):
         rows, cluster_lines = bind_lines(
             [{"text": "（OP 主题歌）", "start_ms": 90_000, "end_ms": 91_000}],
-            [self._turn("A", 0, 1000)], {"A": "SPEAKER_A1"})
+            [self._turn("SPEAKER_A1", 0, 1000)])
         self.assertIsNone(rows[0]["speaker"])
         self.assertEqual(rows[0]["method"], "no_speech_overlap")
         self.assertEqual(cluster_lines, {})
 
     def test_bind_lines_text_agreement_flag(self):
-        turns = [{"raw_label": "A", "start_ms": 0, "end_ms": 2000, "text": "你好世界"}]
-        label_map = {"A": "SPEAKER_A1"}
+        turns = [self._turn("SPEAKER_A1", 0, 2000, text="你好世界")]
         rows, _ = bind_lines([
             {"text": "你好，世界！", "start_ms": 0, "end_ms": 2000},
             {"text": "完全不同的一句话", "start_ms": 0, "end_ms": 2000},
-        ], turns, label_map)
+        ], turns)
         self.assertTrue(rows[0]["text_agreement"])
         self.assertFalse(rows[1]["text_agreement"])
 
     def test_confidence_tiers(self):
         """ratio >= 0.80 -> 0.90; >= 0.50 -> 0.75; below -> 0.55."""
-        label_map = {"A": "SPEAKER_A1"}
-        turn = [self._turn("A", 1000, 4000)]
+        turn = [self._turn("SPEAKER_A1", 1000, 4000)]
 
         def confidence_for(line_start, line_end):
             rows, _ = bind_lines(
-                [{"text": "x", "start_ms": line_start, "end_ms": line_end}],
-                turn, label_map)
+                [{"text": "x", "start_ms": line_start, "end_ms": line_end}], turn)
             return rows[0]["confidence"]
 
         self.assertEqual(confidence_for(1000, 4000), 0.90)  # overlap 4000/4000 = 1.00
@@ -171,7 +217,7 @@ class TestOmniSpeakerMerge(unittest.TestCase):
 
     def test_empty_turns_unattribute_everything(self):
         rows, cluster_lines = bind_lines(
-            [{"text": "x", "start_ms": 0, "end_ms": 1000}], [], {})
+            [{"text": "x", "start_ms": 0, "end_ms": 1000}], [])
         self.assertIsNone(rows[0]["speaker"])
         self.assertEqual(cluster_lines, {})
 
