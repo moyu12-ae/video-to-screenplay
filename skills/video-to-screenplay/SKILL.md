@@ -97,6 +97,7 @@ wait $PID_VISUAL
 **声学分离（你的 MCP 步骤）**：对工作单 `parts[]` 的每一片调用 MCP 工具
 `omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：
 - 参数：`file_path` = 分片绝对路径，`format: "json"`；`num_speakers` 仅当 bible 明确人数时传；`language` 默认不传（自动检测）。
+- **上下文卫生（建议）**：此循环是纯机械动作（调工具 → 存文件），**委托一个子代理执行**——每片的工具返回（JSON 与 SRT 双份文本，整集约 2–3 万 token、电影十万级）只进子代理上下文，主会话只收"全部已保存"的一句结果。上游不稳时在子代理内做"等待 2–3 分钟重试 / 失败片对半切"的循环即可。
 - 把每个返回的 **JSON block 原样保存**到工作单指定的 `output` 路径（`.cache/audio/omni_diarized[.partNNN].json`）——形如 `{"speakers": [...], "segments": [{"speaker","start","end","text"}]}`（秒制）。
 - 分离质量由模型音色聚类保证（对音乐/背景音鲁棒）；**Omni 转写文本只作证据**（`text_agreement` 校验用），绝不进剧本正文。
 
