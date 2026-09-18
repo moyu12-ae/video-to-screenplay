@@ -179,10 +179,17 @@ def main():
 
             matched_speaker = sub.get("speaker") or "SPEAKER_UNKNOWN"
             if matched_speaker == "SPEAKER_UNKNOWN":
+                # Max-overlap beats first-match: bleeding subtitle lines would
+                # otherwise inherit a temporal neighbour's acoustic speaker.
+                best_overlap, best_speaker = 100, "SPEAKER_UNKNOWN"
                 for spk in speakers_data:
-                    if interval_overlap_ms(s_start, s_end, spk.get("start_ms", 0), spk.get("end_ms", 0)) > 100:
-                        matched_speaker = spk.get("speaker", "SPEAKER_UNKNOWN")
-                        break
+                    cand = spk.get("speaker")
+                    if not cand:
+                        continue
+                    ov = interval_overlap_ms(s_start, s_end, spk.get("start_ms", 0), spk.get("end_ms", 0))
+                    if ov > best_overlap:
+                        best_overlap, best_speaker = ov, cand
+                matched_speaker = best_speaker
 
             av_rel = infer_av_relationship(sub, scene)
 

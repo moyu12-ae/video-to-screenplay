@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；场景理解（地点、时辰、出场人物、场面调度）由**唯一一个通用多模态大模型**（即 agent 本身）逐场完成。无专用模型、无 torch、无声学依赖。
+一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（MCP `omni_multi_speaker_asr`，未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
 
 ## 工作原理
 
 1. **纯净三层工作区** —— `materials/`（只读输入）→ `.cache/`（可随时清空的中间产物）→ `output/`（只放最终剧本）。
 2. **字幕门禁** —— 外挂字幕 → 容器内封软字幕 → OCR 网关；纯画面无字幕一律硬性拒止（退出码 5），绝不凭空捏造台词。
-3. **音画双轨并行** —— FFmpeg 切镜与关键帧提取，和字幕提取、纯文本说话人标注（ASS Actor/Name 字段、【角色】/角色：前缀、`-` 破折号稳定 A/B 交替）并发执行。
+3. **音画双轨并行** —— FFmpeg 切镜与关键帧提取，和字幕提取、**声学说话人分离**（ffmpeg 抽 16k 单声道音频 → MCP `omni_multi_speaker_asr` 按音色聚类，>50 分钟自动分片 → 确定性最大重叠绑定到字幕行）并发执行。**归属 100% 归声学**，字幕元数据（ASS Actor、【角色】前缀）只给声学簇投票起名；MCP 不可用时说话人全 null 降级，流水线不阻塞。
 4. **LGSS 思想场景聚类** —— 一维 DP 求解器把 200+ 物理切镜折叠为宏场景。对白穿越的剪切点施加**大额软惩罚**（绝非硬禁止——求解器不可能死锁成"整集一场"，任何被迫切口都会显式上报）。安装 numpy/opencv 后，启用关键帧 HSV 调色板距离（LGSS "place" 模态的轻量代理，理念源自 LGSS, CVPR 2020）锐化边界；未安装则优雅降级为静默/时长启发式。
 5. **毫秒级对齐** —— 每条台词按最大时间重叠唯一归属到一个镜头，并标注 `ON_SCREEN` / `OFF_SCREEN` / `VOICE_OVER` / `INTERNAL_MONOLOGUE`。
 6. **叙事大纲（可选，McKee 序列层）** —— `narrative_outline.py` 生成台词流工作单；agent 按「价值转折」判定写出序列骨架（题目 + 价值 from→to + 起止台词），grouper 随即切换为层级模式：序列墙吸附最近物理切点、逐序列独立求解场景。无大纲则整体平切，行为不变。
@@ -19,6 +19,7 @@
 
 - Python 3.10+
 - PATH 上有 FFmpeg / ffprobe（`brew install ffmpeg`）
+- 推荐：[Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 `api` 插件（配置 `DASHSCOPE_API_KEY`）——启用 Qwen3.8-Omni 声学说话人分离；未配置时说话人列留空，流水线照常运行
 - 可选：`pip install -r requirements.txt`（numpy + opencv-python-headless）——启用场景聚类的视觉 place 亲和度。其余全部纯标准库。
 
 ## 使用
@@ -36,7 +37,11 @@ python3 scripts/workspace.py init  --workspace "<ws>"
 python3 scripts/workspace.py probe --workspace "<ws>"
 python3 scripts/scene_detect.py --workspace "<ws>" --threshold 0.35 > "<ws>/.cache/visual/shots.json"
 python3 scripts/subtitle_extractor.py --workspace "<ws>" --require-subtitles > "<ws>/.cache/subtitles/extracted.json"
-python3 scripts/speaker_diarize.py --workspace "<ws>" > "<ws>/.cache/audio/speakers.json"
+python3 scripts/speaker_diarize.py --workspace "<ws>" prepare > "<ws>/.cache/audio/diarize_workorder.json"  # 退出码 6
+#   ↑ 随后由 agent 对工作单每个分片调用 MCP omni_multi_speaker_asr，
+#     把返回 JSON 原样存到 .cache/audio/omni_diarized[.partNNN].json
+python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
+#   ↑ MCP 不可用时改跑：merge --empty-fallback（说话人全 null 降级）
 python3 scripts/semantic_scene_grouper.py --workspace "<ws>" > "<ws>/.cache/visual/scenes.json"
 python3 scripts/narrative_outline.py --workspace "<ws>"   # 可选：agent 依工作单写叙事大纲后重跑校验
 python3 scripts/align_timeline.py --workspace "<ws>" > "<ws>/.cache/alignment/aligned_timeline.json"

@@ -1,11 +1,11 @@
 ---
 name: video-to-screenplay
-description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门、FFmpeg 场景切点关键帧提取、文本/元数据说话人标注、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
+description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（MCP omni_multi_speaker_asr，不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
 ---
 
 # 视频转剧本流水线（`video-to-screenplay`）
 
-一条逆向还原流水线：把视频反编译为制作级亚洲场号制剧本，附带关键帧真实画面依据、暂定说话人归属、画外台词标注与逐字台词。确定性的 Python 阶段负责一切可量化的计算；全流程只有一个通用多模态 LLM（即 agent 本身）承担场景理解——零专用模型。
+一条逆向还原流水线：把视频反编译为制作级亚洲场号制剧本，附带关键帧真实画面依据、声学说话人归属、画外台词标注与逐字台词。确定性的 Python 阶段负责一切可量化的计算；感知型任务统一交给通用多模态模型——场景理解由 agent 本身逐场完成，说话人**归属**由 MCP 工具 `omni_multi_speaker_asr`（Qwen3.8-Omni 按音色聚类，对 BGM/背景音鲁棒）完成，角色**命名**只由字幕元数据多数票或场景理解 pass 给出。台词文本始终只来自字幕，经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都绝不参与台词文本本身。
 
 ---
 
@@ -21,7 +21,11 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
     │   ├── shots.json             物理镜头切点 + 关键帧文件名
     │   ├── scenes.json            宏场景（LGSS 式动态规划求解）
     │   └── keyframes/             镜头缩略图（shot_XXXX_XXXXXXms.jpg）
-    ├── audio/speakers.json        暂定说话人标签 + characters_manifest
+    ├── audio/
+    │   ├── speakers.json          声学说话人标签 + characters_manifest
+    │   ├── diarize_workorder.json 说话人工作单（prepare 产物，指引 MCP 调用）
+    │   ├── source_audio*.m4a      16k 单声道抽取音频（>50 分钟自动分片）
+    │   └── omni_diarized*.json    MCP omni_multi_speaker_asr 原始返回（证据，只读）
     ├── alignment/
     │   ├── aligned_timeline.json  镜头↔台词主对齐（每条台词恰好分配一次）
     │   └── scene_manifest.json    场景证据包 + 写作契约（阶段 4）
@@ -41,7 +45,9 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
      │
      ├─ 视觉轨：    scene_detect.py       → shots.json + keyframes/
      └─ 台词轨：    subtitle_extractor.py → extracted.json
-                    speaker_diarize.py    → speakers.json
+                    speaker_diarize.py prepare → 抽音频 + 工作单（退出码 6）
+                    agent 调 MCP omni_multi_speaker_asr → omni_diarized*.json
+                    speaker_diarize.py merge   → speakers.json（声学归属 + 元数据命名）
      │  阶段 3：汇流
      ├── semantic_scene_grouper.py → scenes.json   （软惩罚动态规划 + 可选 HSV 场景亲和度）
      │  阶段 3.5：叙事大纲（可选，McKee 序列层：价值转折单位，非地点单位）
@@ -72,7 +78,7 @@ probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随
 - **硬字幕 OCR**（三级）：望言 OCR MCP（`POST /import → /predet → /pipeline → /export`）。OCR 完成后由你把导出文本按规范 schema 落盘到 `.cache/subtitles/extracted.json`——`{"source_tier": "TIER_3_HARDCODED_OCR", "video_path": …, "items": [{"index": 1, "start_ms": …, "end_ms": …, "text": …}, …]}`（index 从 1 连续递增，时间用毫秒整数）。后续所有阶段只认这个文件。
 - 🛑 **快速失败**：纯画面素材且无任何字幕来源 → 运行 `python3 scripts/workspace.py check-subtitles --mode none`，它以退出码 5 结束。绝不编造台词。
 
-### 阶段 2 —— 双轨提取（并发）
+### 阶段 2 —— 双轨提取（并发）+ 声学说话人分离
 
 ```bash
 # 视觉轨（后台）
@@ -80,14 +86,28 @@ python3 scripts/scene_detect.py --workspace "<ws>" --threshold 0.35 > "<ws>/.cac
 PID_VISUAL=$!
 # 台词轨（前台）
 python3 scripts/subtitle_extractor.py --workspace "<ws>" --require-subtitles > "<ws>/.cache/subtitles/extracted.json"
-python3 scripts/speaker_diarize.py   --workspace "<ws>" > "<ws>/.cache/audio/speakers.json"
+# 声学说话人三步：prepare（抽音频 + 工作单）→ MCP 声学分离 → merge（绑定 + 命名）
+python3 scripts/speaker_diarize.py --workspace "<ws>" prepare > "<ws>/.cache/audio/diarize_workorder.json"
 wait $PID_VISUAL
 ```
 
 - `scene_detect.py` 把镜头 JSON 打印到 **stdout**（纯过滤器；按示例重定向）。缺 FFmpeg → 退出码 3。
-- `speaker_diarize.py` 是纯文本/元数据方法（ASS Actor/Name 字段、【角色】/角色： 前缀、`-` 破折号 A/B 交替 → 稳定的 `SPEAKER_00A/00B` 对）。无法归属的行保持 `null`——静默间隙绝不制造幻影说话人。
+- `speaker_diarize.py prepare` 用 ffmpeg 抽 16k 单声道音频（>50 分钟自动切 ≤45 分钟分片），写 `diarize_workorder.json` 后**退出码 6**——等待你完成 MCP 调用。无音频流的工作单 `status=no_audio_stream`。
 
-🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空。
+**声学分离（你的 MCP 步骤）**：对工作单 `parts[]` 的每一片调用 MCP 工具
+`omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：
+- 参数：`file_path` = 分片绝对路径，`format: "json"`；`num_speakers` 仅当 bible 明确人数时传；`language` 默认不传（自动检测）。
+- 把每个返回的 **JSON block 原样保存**到工作单指定的 `output` 路径（`.cache/audio/omni_diarized[.partNNN].json`）——形如 `{"speakers": [...], "segments": [{"speaker","start","end","text"}]}`（秒制）。
+- 分离质量由模型音色聚类保证（对音乐/背景音鲁棒）；**Omni 转写文本只作证据**（`text_agreement` 校验用），绝不进剧本正文。
+
+```bash
+python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
+```
+
+- `merge` 确定性执行：分片时间偏移还原 → 每条字幕按**最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
+- 未配置 qwen-mm-plugins / 无 DASHSCOPE_API_KEY / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
+
+🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空；`speakers.json` 已产出（声学合并或 `--empty-fallback` 皆可）。
 
 ### 阶段 3 —— 汇流：语义分组与时间线对齐
 
@@ -150,6 +170,10 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 失败情形 | 信号 | 响应 |
 | :--- | :--- | :--- |
 | 完全没有字幕 | probe 为空 + 用户确认 | 硬性拒绝，退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
+| qwen-mm-plugins 未安装 / 无 DASHSCOPE_API_KEY | prepare（退出码 6）后无法调用 MCP | `merge --empty-fallback`：speakers.json 全 null + WARN，流水线继续，说话人列留空 |
+| Omni 输出缺失/非法/分片不全 | merge **退出码 7** 并点名文件 | 按 `diarize_workorder.json` 补做对应分片的 MCP 调用后重跑 `merge` |
+| 视频无音频流 | 工作单 `status=no_audio_stream` | 直接 `merge --empty-fallback`；对白只存在于字幕层，流水线不受影响 |
+| Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
 | 缺 FFmpeg | scene_detect 退出码 3 / doctor 退出码 3 | 停止，原样上报，绝不借用无关 MCP |
 | 分组器 `forced_dialogue_cuts > 0` | stderr WARN | 可能出现台词中途切场；检查字幕对齐 / `--max-scenes` 余量 |
@@ -166,7 +190,9 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | :--- | :--- |
 | 根目录乱丢文件 | 一切非交付物都在 `.cache/` 内 |
 | 为无声画面编造台词 | 硬性拒绝；无字幕 → 不开工 |
-| 把暂定标签渲染成真名 | `SPEAKER_*` / 未归属 → `人物`，直到场景理解 pass 给出命名 |
+| 把暂定标签渲染成真名 | `SPEAKER_*`（含声学 `SPEAKER_A*`）/ 未归属 → `人物`，直到场景理解 pass 给出命名 |
+| 用 Omni 转写文本代替字幕台词 | 转写仅作 `text_agreement` 证据；台词一律 `[[SUB:n]]` 逐字来自字幕 |
+| 用字幕元数据改判声学归属 | 元数据只给声学簇**投票起名**（份额 ≥0.6、≥2 票）；"谁在说"永远由音色聚类决定 |
 | 幻觉动作行 | 动作草稿只写关键帧可见内容；未验证的镜头保持未验证 |
 | 在 DP 中硬禁台词切点 | 软惩罚 + `forced_dialogue_cuts` 报告——绝不用硬 INF 静默地把整集塌缩成一场 |
 | 跳过场景写作 pass | splice 会中止，直到每场文本覆盖其全部字幕；必须先跑阶段 4，若跳过须如实说明 |

@@ -155,7 +155,8 @@ def run_doctor_check(workspace: Path | str | None = None) -> None:
         "ffmpeg": {"ready": False, "path": shutil.which("ffmpeg"), "version": None},
         "ffprobe": {"ready": False, "path": shutil.which("ffprobe"), "version": None},
         "numpy": {"ready": False, "version": None},
-        "diarization_engine": "metadata_nlp_attribution",
+        "diarization_engine": "qwen3_8_omni_acoustic_diarization (MCP: omni_multi_speaker_asr; "
+                              "falls back to all-null speakers without it)",
         "platform": sys.platform
     }
 

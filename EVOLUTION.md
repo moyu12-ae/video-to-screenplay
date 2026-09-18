@@ -52,3 +52,29 @@
 | **TC-02: Embedded ASS Stream** | `animeB_ep08.mkv`（双 ASS 轨） | Tier 2 (Embedded Stream) | Detected 2 ASS tracks (简日双语 & 繁日雙語), cleaned tags | **0.18s** |
 | **TC-03: Embedded SubRip Stream** | `animeB_ep01.mkv` | Tier 2 (Embedded Stream) | Auto-selected Stream #2 (`chi` 简体中文) out of 5 languages | **0.12s** |
 | **TC-04: Hardcoded Burnt-in** | `animeB_ep04.mp4` | Tier 3 (Wangyan OCR Fallback) | Correctly identified 0 external / 0 embedded streams, emitted OCR instruction | **0.05s** |
+
+---
+
+## 5. v0.3.0 — Acoustic Speaker Attribution (Qwen3.8-Omni)
+
+- **Motivation (v0.2.0 limitation)**: pure text/metadata attribution capped out at dash-alternation
+  confidence **0.55**; scenes with 3+ simultaneous speakers were a structural blind spot (only
+  stable A/B pairs); unattributed lines (0.30) leaned entirely on downstream LLM guessing.
+- **Trigger**: Qwen3.8-Omni-Flash made full-episode acoustic diarization cheap (per-hour audio
+  input price down >98%) and robust to music/BGM — decisive for anime and film material.
+- **Architecture change**:
+
+  | Aspect | v0.2.0 | v0.3.0 |
+  | :--- | :--- | :--- |
+  | **Attribution** | text syntax + dash A/B alternation (conf 0.55) | 100% acoustic timbre clusters via MCP `omni_multi_speaker_asr` (qwen3.8-omni-flash) |
+  | **Naming** | metadata names WERE the attribution | metadata names only VOTE (share ≥ 0.6, ≥ 2 votes) to name clusters; unnamed clusters stay `SPEAKER_A{n}` |
+  | **Long videos** | n/a | ffmpeg auto-chunks past 50 min into ≤ 45-min parts; offsets restored deterministically |
+  | **Overlap dialogue** | invisible | `secondary_speaker` recorded when a 2nd cluster covers ≥ 40% of the line |
+  | **Degradation** | n/a | `merge --empty-fallback` → all-null `speakers.json` + WARN; pipeline never blocks |
+  | **Invariant** | `[[SUB:n]]` verbatim splice | **unchanged** — Omni transcripts are evidence only (`text_agreement`), never dialogue text |
+
+- **Compatibility**: `speakers.json` keeps `segments[].{segment_id, start_ms, end_ms, speaker,
+  confidence, method}` and `characters_manifest`; `clusters[]`, `speech_turns[]`,
+  `diarization_source{}` are additive. `align_timeline.py`'s fallback lookup upgraded
+  first-match → max-overlap (bleeding subtitle lines no longer inherit a neighbour's speaker).
+  The legacy dash-alternation/text-syntax per-line attribution was removed.
