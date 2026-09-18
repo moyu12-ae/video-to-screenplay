@@ -59,6 +59,9 @@ SILENCE_SNAP_TOLERANCE_SEC = 5.0
 SILENCE_DETECT_NOISE = "-30dB"
 SILENCE_DETECT_MIN_D = "0.3"
 COOCCUR_MIN_RATIO = 0.5        # cross-part turns overlapping ≥50% of the shorter = same voice
+SUBTITLE_OFFSET_SEARCH_SEC = 5.0   # global subtitle-vs-audio shift search range (±5s)
+SUBTITLE_OFFSET_STEP_MS = 250      # shift search granularity
+MIN_SUBTITLE_LINES_FOR_OFFSET = 6  # below this, a global shift estimate is noise
 
 EXIT_OK = 0
 EXIT_BAD_INPUT = 1
@@ -511,10 +514,43 @@ def _overlap_ms(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
+def estimate_subtitle_offset_ms(items: List[Dict[str, Any]],
+                                turns: List[Dict[str, Any]]) -> int:
+    """Subtitles are only a ROUGH frame of the dialogue timeline, and fan-sourced
+    subs are often systematically shifted against the audio (typically leading by
+    1-3 s). The acoustic turns are the accurate timeline, so estimate ONE global
+    shift — applied to subtitle windows — that maximizes total best-overlap
+    against them: cross-correlation between the two timelines. Deterministic;
+    returns 0 unless enough lines exist for a meaningful consensus."""
+    if not items or not turns or len(items) < MIN_SUBTITLE_LINES_FOR_OFFSET:
+        return 0
+    span = int(SUBTITLE_OFFSET_SEARCH_SEC * 1000)
+    step = SUBTITLE_OFFSET_STEP_MS
+    turn_spans = [(t["start_ms"], t["end_ms"]) for t in turns]
+    scored: List[Tuple[float, int, int]] = []  # (total, -abs(delta), delta)
+    for delta in range(-span, span + 1, step):
+        total = 0.0
+        for it in items:
+            s = int(it.get("start_ms", 0)) + delta
+            dur = max(1, int(it.get("end_ms", s)) - int(it.get("start_ms", 0)))
+            best = 0.0
+            for ts, te in turn_spans:
+                ov = _overlap_ms(s, s + dur, ts, te)
+                if ov and ov / dur > best:
+                    best = ov / dur
+            total += best
+        scored.append((round(total, 6), -abs(delta), delta))
+    return max(scored)[2]
+
+
 def bind_lines(items: List[Dict[str, Any]],
-               turns: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
+               turns: List[Dict[str, Any]],
+               offset_ms: int = 0) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     """Bind each subtitle line to the max-overlap voice cluster (turns carry
-    their cluster_id from build_cluster_map). Returns (segments rows,
+    their cluster_id from build_cluster_map). Line windows are shifted by the
+    GLOBAL subtitle-vs-audio offset before matching, so systematic fan-sub drift
+    cannot steal a line onto the previous speaker's trailing turn; reported
+    start_ms/end_ms stay the original subtitle timecodes. Returns (segments rows,
     cluster_id -> contributing line dicts)."""
     rows: List[Dict[str, Any]] = []
     cluster_lines: Dict[str, List[Dict[str, Any]]] = {}
@@ -523,11 +559,13 @@ def bind_lines(items: List[Dict[str, Any]],
         end = int(item.get("end_ms", start))
         dur = max(1, end - start)
         text = str(item.get("text", ""))
+        # corrected windows: subtitle frame shifted onto the acoustic timeline
+        c_start, c_end = start + offset_ms, end + offset_ms
 
         best: Optional[Dict[str, Any]] = None
         second: Optional[Dict[str, Any]] = None
         for t in turns:
-            ov = _overlap_ms(start, end, t["start_ms"], t["end_ms"])
+            ov = _overlap_ms(c_start, c_end, t["start_ms"], t["end_ms"])
             if ov <= 0:
                 continue
             cand = {"turn": t, "overlap": ov, "ratio": ov / dur}
@@ -597,7 +635,8 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
                  cluster_lines: Dict[str, List[Dict[str, Any]]], turns: List[Dict[str, Any]],
                  names: Dict[str, Optional[str]],
                  manifest: Dict[str, int], parts_used: List[str],
-                 empty_reason: Optional[str] = None) -> Dict[str, Any]:
+                 empty_reason: Optional[str] = None,
+                 subtitle_alignment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     named_rows = []
     for r in rows:
         row = dict(r)
@@ -634,6 +673,7 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
             "model": "qwen3.8-omni-flash (MCP default)",
             "parts": parts_used,
         },
+        "subtitle_alignment": subtitle_alignment,
         "characters_manifest": manifest,
         "clusters": clusters,
         "speech_turns": [
@@ -760,9 +800,9 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
         return
 
     parts_used, turns = load_omni_parts(ws)
-    rows, cluster_lines = bind_lines(items, turns)
 
     if not turns:
+        rows, cluster_lines = bind_lines(items, [])
         sys.stderr.write("[WARN] Diarization produced zero speech turns; all speakers null "
                          "(check the audio track / subtitle tier)\n")
         sys.stdout.write(json.dumps(
@@ -771,10 +811,21 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
             ensure_ascii=False, indent=2) + "\n")
         return
 
+    offset_ms = estimate_subtitle_offset_ms(items, turns)
+    if offset_ms:
+        sys.stderr.write(f"[INFO] Global subtitle-vs-audio offset: {offset_ms:+d} ms "
+                         "(subtitle windows shifted before binding)\n")
+    rows, cluster_lines = bind_lines(items, turns, offset_ms)
+    alignment = {
+        "offset_ms": offset_ms,
+        "search_range_sec": SUBTITLE_OFFSET_SEARCH_SEC,
+        "step_ms": SUBTITLE_OFFSET_STEP_MS,
+        "method": "global_cross_correlation",
+    }
     names, manifest = name_clusters(cluster_lines)
     sys.stdout.write(json.dumps(
         build_output(video_name, items, rows, cluster_lines, turns,
-                     names, manifest, parts_used),
+                     names, manifest, parts_used, subtitle_alignment=alignment),
         ensure_ascii=False, indent=2) + "\n")
 
 

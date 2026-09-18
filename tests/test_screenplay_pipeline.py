@@ -24,6 +24,7 @@ from subtitle_extractor import extract_speaker_from_text
 from speaker_diarize import (
     bind_lines,
     build_cluster_map,
+    estimate_subtitle_offset_ms,
     is_provisional_label,
     name_clusters,
     normalize_omni_segments,
@@ -220,6 +221,36 @@ class TestOmniSpeakerMerge(unittest.TestCase):
             [{"text": "x", "start_ms": 0, "end_ms": 1000}], [])
         self.assertIsNone(rows[0]["speaker"])
         self.assertEqual(cluster_lines, {})
+
+    def test_estimate_offset_and_bind_tolerate_subtitle_lead(self):
+        """第三集 52.2s 案例复现：字幕整体超前 ~2.3s 时，换人边界的行会被前一
+        说话人的杂散短尾句抢走；全局偏移估计 + 校正后应绑到真正的后一说话人。"""
+        A, B = "SPEAKER_A1", "SPEAKER_A2"
+        turns = [
+            self._turn(A, 30_000, 32_000), self._turn(A, 33_000, 35_000),
+            self._turn(A, 36_000, 38_000), self._turn(A, 38_000, 39_500),
+            self._turn(A, 52_680, 53_080),   # 前一说话人的杂散短尾句
+            self._turn(B, 54_680, 56_680),   # 后一说话人真正开口
+        ]
+        items = [
+            {"text": "a", "start_ms": 27_700, "end_ms": 29_700},
+            {"text": "b", "start_ms": 30_700, "end_ms": 32_700},
+            {"text": "c", "start_ms": 33_700, "end_ms": 35_700},
+            {"text": "d", "start_ms": 35_700, "end_ms": 37_200},
+            {"text": "e", "start_ms": 27_800, "end_ms": 29_600},
+            {"text": "大津！你一个后辈", "start_ms": 52_380, "end_ms": 54_380},  # contested
+        ]
+        self.assertEqual(estimate_subtitle_offset_ms(items, turns), 2_250)
+        rows, _ = bind_lines(items, turns, offset_ms=2_250)
+        self.assertEqual(rows[5]["cluster_id"], B)          # 校正后绑到长浜
+        self.assertEqual(rows[5]["confidence"], 0.90)
+        rows0, _ = bind_lines(items, turns, offset_ms=0)    # 回归对照：不校正则被抢
+        self.assertEqual(rows0[5]["cluster_id"], A)
+
+    def test_estimate_offset_needs_enough_lines(self):
+        turns = [self._turn("SPEAKER_A1", 20_000, 22_000)]
+        items = [{"text": "x", "start_ms": 17_700, "end_ms": 19_700}] * 3
+        self.assertEqual(estimate_subtitle_offset_ms(items, turns), 0)  # <6 行不启用
 
     def test_is_provisional_label_covers_acoustic_labels(self):
         self.assertTrue(is_provisional_label("SPEAKER_A1"))

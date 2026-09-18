@@ -98,3 +98,16 @@
 - **Known residual (v0.3.2 candidate)**: subtitles leading the audio by ~2 s can steal a line's
   max-overlap binding at speaker transitions; a global subtitle↔audio offset estimate is the
   likely fix.
+
+## 7. v0.3.2 — Global Subtitle↔Audio Offset Correction
+
+- **Trigger (same ep3 live test)**: with subtitles leading the audio by ~2.3 s, the contested
+  line at 52.2 s ("大津！你一个后辈") bound to the previous speaker's stray micro-turn instead of
+  the intended speaker. Subtitles are only a rough frame; the acoustic timeline is authoritative.
+- **Fix**: before binding, estimate ONE global shift (cross-correlation: ±5 s range, 0.25 s
+  steps, applied to subtitle windows, maximizing total best-overlap; enabled at ≥6 lines) and
+  bind on corrected windows. Reported timecodes stay the original subtitle timecodes; the
+  estimate is recorded in `speakers.json → subtitle_alignment` for audit.
+- **Result (ep3, 0–83 s)**: the contested line now binds to the correct speaker; three lines
+  that previously fell outside every turn ("菈菈？", "这是水！", "明天打一场实战") are recovered;
+  every in-range line is attributed (31/31).

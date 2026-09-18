@@ -104,7 +104,7 @@ wait $PID_VISUAL
 python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
 ```
 
-- `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ 每条字幕按**最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
+- `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ **全局字幕-音频偏移估计**（字幕只是粗框，常整体超前音频 1–3 秒；±5s/0.25s 步长互相关求最优整体偏移，≥6 行才启用）→ 每条字幕按**校正后最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
 - 未配置 qwen-mm-plugins / 无 DASHSCOPE_API_KEY / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
 
 🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空；`speakers.json` 已产出（声学合并或 `--empty-fallback` 皆可）。
