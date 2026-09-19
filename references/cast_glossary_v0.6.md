@@ -40,6 +40,7 @@ bible/manifest/台词"，但没有任何检查器兜底——所以它必然失�
 证据生产者（只出证据，绝不写结论）
   speaker_diarize.py   → 簇 + 语音窗 + 声学属性(性别/年龄带/音线)        ← 新增字段
   av_understand.py     → 视觉锚点 + speaking/mouth_moving 时间窗          ← 新增通道
+  嘴部 ROI 帧差检测    → 确定性 ASD 证据（动/静/未覆盖），可复现可回放    ← 新增，主仪器
   字幕文本（本地）     → 呼语证据："茉里 你交朋友了" ⇒ 茉里是被称呼者    ← 新增，零成本
   外部资料（人工触发） → 实体清单与正确写法（不是归属！见 §5）
         ↓
@@ -75,18 +76,34 @@ materials/cast.approved.json（系列级，只读）
     "evidence": [{"kind": "subtitle_address", "line": 7, "note": "被『茉里 你交朋友了』称呼"}],
     "approved_by": "human", "approved_at": "2026-09-19"
   }],
+  "slots": [{
+    "slot_id": "S1",
+    "profile": {"gender": "male", "age_band": "young_adult", "visual": "金发、青绿外套/浅色围裙、左耳环"},
+    "coverage": {"windows_total": 6, "windows_visual_usable": 4, "agreement": 0.86},
+    "status": "candidate",
+    "entity_id": null
+  }],
   "clusters": [{
     "cluster_id": "SPEAKER_A1",
-    "assignment": {"entity_id": "C3", "confidence": 0.91, "margin": 0.44,
-                   "basis": ["acoustic.gender=male", "mouth_moving.agreement=0.86", "address_terms=none"]},
+    "assignment": {"slot_id": "S1", "confidence": 0.91, "margin": 0.44,
+                   "families_supporting": ["acoustic", "visual"],
+                   "basis": ["acoustic.gender=male", "mouth_roi.agreement=0.86 (4/6 windows)",
+                             "address_terms=none"]},
     "speech_ms": 11090, "line_count": 6
   }],
   "pending": [{"entity_id": "C7", "reason": "第 3 集新出现，未签核"}]
 }
 ```
 
-设计要点：`visual_anchors` 是**数组**（换装、不同镜头）；`margin` 必填（最优 vs 次优差值）；
-`status` 只有 `approved | candidate | unknown` 三态，**没有"默认相信模型"这一态**。
+设计要点：
+
+- **槽位与命名是两层**：`slots` 是机器收敛出的"角色画像"（性别/年龄带/外观/覆盖率），
+  `entities` 是人签核的"叫什么"。`clusters → slot` 由证据决定，`slot → entity` 由人决定。
+  机器**永不**直接产出名字（详见 §2 末与 §6）。
+- `visual_anchors` / `profile.visual` 是**多条**（换装、不同镜头）。
+- `margin` 与 `families_supporting` 必填；`coverage` 记录视觉证据的可用窗口比例——
+  缺数据与信号弱是两件事，必须分开记（见 §7）。
+- `status` 只有 `approved | candidate | unknown` 三态，**没有"默认相信模型"这一态**。
 
 ## 4. 生命周期
 
@@ -111,7 +128,8 @@ materials/cast.approved.json（系列级，只读）
 | 检查 | 级别 | 位置 |
 | :--- | :--- | :--- |
 | 说话人名不在 approved 表及其别名内 | **致命** | `splice_screenplay.py` lint |
-| 呼语冲突：某人名字出现在他自己的台词里作呼语 | **致命**（可 `--allow` 逐条豁免） | 同上 |
+| 说话人标签与本句呼语相同（自相矛盾） | `text_subtitle` 族**负证据**，进综合判定；不单独致命 | `resolve_cast.py` |
+| 机器把槽位直接写成专名（无 `slot → entity` 人签核记录） | **致命** | `resolve_cast.py` 写盘前校验 |
 | 写作者改判了 `cast.json` 的簇归属但草稿无留痕注释 | **致命** | 同上 |
 | 存在 `unknown` 簇却出现了专名 | **致命** | 同上 |
 | margin 低于阈值仍给出归属 | 告警 + 保真报告列明 | `resolve_cast.py` |
@@ -124,13 +142,32 @@ materials/cast.approved.json（系列级，只读）
 
 - **声学属性**（性别/年龄带/音线）：在**已付费的同一次分离调用**里多问几个字段，零额外调用。
   未知值一律 `unknown`，禁止兜底猜测。
-- **`speaking` / `mouth_moving` 通道**：加进 AV prompt（同样零额外调用）。动画嘴型是 2-3 帧循环，
-  所以只取**二值**（动/静/看不清），不做音素级同步；真人向的 SyncNet 类指标在番剧上失效，不引入。
+- **视觉说话（ASD）= 主证据族**。要问的不是"口型对不对得上这个音"（音素级同步，番剧确实失效），
+  而是"这个人的嘴在这段窗口里动不动"——**循环嘴型对这个二值问题几乎无损**：一个 3 帧循环的嘴仍然
+  意味着"他在说话"。在音视频说话人分离这条线上，视觉 ASD 本就是最强的单信号，融合时通常压过文本线索。
+  因此它不是"低权重投票人"，是第一投票人。
+- **限制是覆盖率，不是可靠性**。听者反应镜头、背影、画外音、远景小脸拿不到视觉证据——这是**缺数据**，
+  不是**信号弱**：前者如实记 `unknown` 并统计 `coverage`，后者才需要降权。两者混为一谈会让"没看到"
+  被误读成"不是他"。置信度按**覆盖窗口上的 agreement rate** 算，窗口越多估计越紧（样本量换置信度）。
+- **边界精度有限**：循环嘴型给不出 ±0.1s 的起止，所以视觉证据只在 **≥1 秒**的窗口上生效，不做逐字对齐。
+- **主仪器必须是确定性的**：风险不在嘴型循环，在"由谁来看"。让多模态大模型自报"谁的嘴在动"，可靠性会掉
+  （VLM 在多张同框脸上做细粒度时间归属本就不擅长，且回答不可审计）。所以主仪器用**嘴部 ROI 帧差能量**
+  （纯 opencv，已是可选依赖），输出可复现、可回放的数值；AV 模型的 `speaking` 只作第二票，用于 ROI
+  定位不到脸的镜头。
+- **`source_type` 决定权重**：`anime | live_action | dub`。真人向 ASD 更强（真音素同步可用），
+  权重自动上调——本插件要扩展到真人，这套不能为番剧特化。
+- **证据族内不叠票**（否则置信度系统性虚高）：`acoustic` / `visual` / `text_native`（原声转写）/
+  `text_subtitle`（字幕译文）/ `external`。同一次 AV 调用同时给的"他在画面里"和"他的嘴在动"是
+  **一票不是两票**；日语原声的"俺"与中文译文的呼语是同一源文本的两种呈现，也不算两票。
+  `margin` 之外还要卡 `families_supporting` 的最少族数：只有单一族支持的结论最多是 `candidate`。
+- **呼语（vocative）= 指向听话人、绝不指向说话人**。所以"说话人标签 == 本句呼语"是自相矛盾，
+  它作为 `text_subtitle` 族的**负证据**参与综合判定（而非致命规则）：真出现"角色念自己名字"时，
+  会被其他族压过去，不需要豁免开关。
 - **视觉锚点归一**：跨窗口稳定 ID，是共现统计的前置条件（没有它，§3 的矩阵根本对不齐）。
 - **跨语言 `text_agreement` 处置**：本素材音轨是日语原声、字幕是中文译文，实测 `text_agreement: null`。
   跨语言的文本相似度不是"低"而是**无意义**，必须显式降级为 `not_applicable`，不能留 null 让人误读。
-- **口型只能是投票人**：番剧大量听者特写、背影、画外音（本次 AV 笔记就有"背对镜头站在窗前水槽边"），
-  每条证据都要能取 `unknown`。
+- **视觉证据必须能取 `unknown`**：番剧大量听者特写、背影、画外音（本次 AV 笔记就有"背对镜头站在窗前
+  水槽边"），这些窗口按 `coverage` 记为"未覆盖"，而不是记为"不是他"。
 
 ## 8. `--draft` 降级语义
 
@@ -158,12 +195,18 @@ materials/cast.approved.json（系列级，只读）
 
 ## 11. 未决问题（需要拍板）
 
-1. 呼语冲突判致命会不会误伤"角色念自己名字"的真实台词？（倾向：致命 + 逐条 `--allow` 豁免）
-2. 声学属性要不要含 `emotion`？（倾向：不含——对命名无帮助，且增加模型输出漂移面）
-3. 自动归属在什么阈值下允许直接写进成稿？（倾向：**永不**，只写候选；与"绝不静默降级"一致）
+1. ~~呼语冲突判致命会不会误伤"角色念自己名字"？~~ **已决**：不判致命，改为 `text_subtitle` 族的
+   负证据进综合判定（§6、§7），真出现自我称呼时会被其他族压过去，不需要豁免开关。
+2. 声学属性要不要含 `emotion`？（倾向：不含——对槽位收敛无帮助，且增加模型输出漂移面）
+3. ~~自动归属在什么阈值下允许直接写进成稿？~~ **已决**：`clusters → slots`（身份连续性）可由机器按阈值
+   自动合并；`slots → entities`（命名）**永不**自动，必须人签核（§3、§6）。
 4. approved 表放系列目录还是每集工作区？（倾向：系列目录 + 工作区只读快照，保证可复现）
+5. **新增**：嘴部 ROI 帧差需要人脸/嘴部定位。番剧脸上检测用 haarcascade（opencv 自带、无新依赖）
+   还是让 AV 模型给 ROI 坐标？前者可审计但对动画脸命中率未知，需实测；后者命中率高但不可审计。
+   建议：先拿本次这集做一轮命中率实测再定，别先选。
 
 ## 12. 明确不做
 
-不做真人向口型同步模型；不引入 torch 级依赖（保持"纯标准库 + 可选 numpy/opencv"）；不让脚本自动
-联网抓资料；不用外部 cast 决定归属；不在表里存任何凭据。
+不做**音素级**口型同步（SyncNet / LSE-D 那类，番剧无效，且我们要的是 ASD 而非它）；不引入 torch 级
+依赖（保持"纯标准库 + 可选 numpy/opencv"，ASD 用嘴部 ROI 帧差即可）；不让脚本自动联网抓资料；
+不用外部 cast 决定归属；不让机器把槽位直接写成专名；不在表里存任何凭据。
