@@ -163,3 +163,18 @@
   (Bailian console link, env exports, gate behavior); plugin.json descriptions mention the key.
 - **Tests**: first workspace.py coverage — `TestWorkspaceDoctor` (5 cases incl. a no-leak
   assertion running doctor with a fake key).
+
+## 10. v0.4.2 — Embedded Subtitle Track Selection Guard
+
+- **Trigger (ep5 live test)**: a 17-subtitle-stream CR WEB-DL episode; a signs-only ASS track
+  (265/271 lines tagged `SIGN`, zero dialogue) entered the pipeline — 39.5 % of lines fell
+  outside every speech turn and the metadata majority vote named every acoustic cluster "SIGN".
+  The acoustic layer itself was flawless; the dialogue-track choice was the failure point.
+- **Fix**: `select_embedded_stream()` (pure, unit-tested) now (1) skips probable non-dialogue
+  tracks (titles matching forced/sign/song/lyric/credit, or the forced disposition flag) with a
+  stderr warning per skip; (2) prefers the user's language (`--lang`, default
+  `chi,zho,chs,cht,zh` — the pipeline writes Chinese screenplays); (3) falls back to the first
+  surviving track, then to an absolute last resort when every track looks like signs. The choice
+  and all skipped tracks are recorded in `extracted.json → embedded_stream` for audit.
+- **Scope note**: hardening the naming vote itself (ignoring SIGN-like metadata labels inside
+  `name_clusters`) remains a possible v0.5 item; the selection guard removes the main entry path.

@@ -226,6 +226,57 @@ def parse_ass_file(file_path: str) -> List[Dict[str, Any]]:
     return entries
 
 
+# Track titles matching these (case-insensitive) carry on-screen text / songs, not
+# dialogue - binding voice clusters to them poisons the naming vote (observed live:
+# a signs-only track named every cluster "SIGN").
+SUBTITLE_TRACK_SKIP_KEYWORDS = ("forced", "sign", "song", "lyric", "credit")
+
+
+def _stream_text(s: Dict[str, Any]) -> str:
+    tags = s.get("tags", {}) or {}
+    return (str(tags.get("language", "")).lower(), str(tags.get("title", "")).lower())
+
+
+def select_embedded_stream(sub_streams: List[Dict[str, Any]],
+                           lang_prefs: List[str]) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str]:
+    """Pick the embedded subtitle stream most likely to be DIALOGUE.
+
+    Order: (1) skip probable non-dialogue tracks (Forced / Signs / Songs titles or
+    the forced disposition flag); (2) first stream matching the user's language
+    preferences (default chi,zho,chs,cht,zh - the pipeline writes Chinese
+    screenplays); (3) first surviving track when no language matches; (4) absolute
+    last resort when every track looks like a signs track. Pure; deterministic.
+    Returns (selected_stream, skipped_entries, reason)."""
+    skipped: List[Dict[str, Any]] = []
+    survivors: List[Dict[str, Any]] = []
+    for s in sub_streams:
+        lang, title = _stream_text(s)
+        lowered = f"{lang} {title}"
+        hit = next((k for k in SUBTITLE_TRACK_SKIP_KEYWORDS if k in lowered), None)
+        forced_flag = int((s.get("disposition", {}) or {}).get("forced", 0) or 0)
+        if hit or forced_flag:
+            skipped.append({"index": s.get("index"), "language": lang, "title": title.strip(),
+                            "why": "disposition_forced" if forced_flag else f"title_keyword:{hit}"})
+        else:
+            survivors.append(s)
+
+    reason = ""
+    selected: Optional[Dict[str, Any]] = None
+    for pref in lang_prefs:
+        for s in survivors:
+            lang, title = _stream_text(s)
+            if pref in lang or pref in title:
+                selected, reason = s, f"language_match:{pref}"
+                break
+        if selected:
+            break
+    if selected is None and survivors:
+        selected, reason = survivors[0], "language_fallback_first_non_sign"
+    if selected is None and sub_streams:
+        selected, reason = sub_streams[0], "last_resort_all_look_like_signs"
+    return selected, skipped, reason
+
+
 class SubtitleExtractor:
     """Adaptive Multi-Source Subtitle Extractor."""
 
@@ -269,8 +320,9 @@ class SubtitleExtractor:
 
         return None
 
-    def check_tier2_embedded(self) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
-        """Tier 2: Inspect video container for embedded soft subtitle streams using ffprobe."""
+    def check_tier2_embedded(self) -> Optional[Tuple[str, List[Dict[str, Any]], Dict[str, Any]]]:
+        """Tier 2: Inspect video container for embedded soft subtitle streams using ffprobe.
+        Returns (source_detail, entries, selection_meta) so the choice is auditable."""
         if not require_ffprobe():
             return None
         try:
@@ -290,25 +342,22 @@ class SubtitleExtractor:
             if not sub_streams:
                 return None
 
-            selected_stream = None
-            for pref in self.lang_prefs:
-                for s in sub_streams:
-                    tags = s.get("tags", {})
-                    lang = str(tags.get("language", "")).lower()
-                    title = str(tags.get("title", "")).lower()
-                    if pref in lang or pref in title:
-                        selected_stream = s
-                        break
-                if selected_stream:
-                    break
-
-            if not selected_stream:
-                selected_stream = sub_streams[0]
+            selected_stream, skipped_streams, reason = select_embedded_stream(sub_streams, self.lang_prefs)
+            for sk in skipped_streams:
+                sys.stderr.write(f"[WARN] Skipping subtitle stream #{sk['index']} "
+                                 f"(lang={sk['language']}, title='{sk['title']}') -> {sk['why']}\n")
 
             stream_idx = int(selected_stream["index"])
             codec_name = str(selected_stream.get("codec_name", "subrip"))
             track_title = str(selected_stream.get("tags", {}).get("title", f"Stream #{stream_idx}"))
             track_lang = str(selected_stream.get("tags", {}).get("language", "und"))
+            selection_meta = {
+                "selected_index": stream_idx,
+                "selected_language": track_lang,
+                "selected_title": track_title.strip(),
+                "reason": reason,
+                "skipped": skipped_streams,
+            }
 
             out_ext = ".ass" if "ass" in codec_name else ".srt"
             temp_sub = os.path.join(tempfile.gettempdir(), f"extracted_stream_{stream_idx}{out_ext}")
@@ -326,8 +375,8 @@ class SubtitleExtractor:
                 else:
                     entries = parse_srt_file(temp_sub)
                 if entries:
-                    info = f"TIER_2_EMBEDDED: Stream #{stream_idx} ({codec_name}, lang={track_lang}, title='{track_title}')"
-                    return (info, entries)
+                    info = f"TIER_2_EMBEDDED: Stream #{stream_idx} ({codec_name}, lang={track_lang}, title='{track_title}', reason={reason})"
+                    return (info, entries, selection_meta)
 
         except Exception as e:
             sys.stderr.write(f"[WARN] Tier 2 extraction failed: {e}\n")
@@ -352,11 +401,12 @@ class SubtitleExtractor:
         sys.stderr.write("[2/3] Checking Tier 2 (Embedded Container Subtitle Streams)...\n")
         tier2_res = self.check_tier2_embedded()
         if tier2_res:
-            source, items = tier2_res
+            source, items, selection_meta = tier2_res
             sys.stderr.write(f" -> Extracted embedded stream: {source} ({len(items)} lines)\n")
             return {
                 "source_tier": "TIER_2_EMBEDDED",
                 "source_detail": source,
+                "embedded_stream": selection_meta,
                 "video_path": self.video_path,
                 "subtitle_count": len(items),
                 "items": items

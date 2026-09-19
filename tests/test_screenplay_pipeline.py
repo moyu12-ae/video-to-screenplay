@@ -43,6 +43,7 @@ from speaker_diarize import (
 import omni_client
 import workspace
 from align_timeline import infer_av_relationship
+from subtitle_extractor import select_embedded_stream
 
 
 class TestSpeakerPrefixParsing(unittest.TestCase):
@@ -595,6 +596,50 @@ class TestSpeakerDiarizeRun(unittest.TestCase):
         work = make_workorder("v.mkv", 60_000, [(0, 60_000)], None, None, no_audio=False)
         self.assertIn("`run`", work["note"])
         self.assertIn("omni_multi_speaker_asr", work["note"])
+
+
+class TestSubtitleStreamSelection(unittest.TestCase):
+    """Embedded track selection: user language first, signs/forced tracks skipped."""
+
+    def test_prefers_user_language(self):
+        streams = [{"index": 4, "tags": {"language": "eng", "title": ""}},
+                   {"index": 18, "tags": {"language": "chi", "title": "Simplified"}}]
+        sel, skipped, reason = select_embedded_stream(streams, ["chi", "zho"])
+        self.assertEqual(sel["index"], 18)
+        self.assertEqual(reason, "language_match:chi")
+        self.assertEqual(skipped, [])
+
+    def test_skips_forced_disposition_even_in_user_language(self):
+        streams = [{"index": 3, "tags": {"language": "chi", "title": "Simplified"},
+                    "disposition": {"forced": 1}},
+                   {"index": 4, "tags": {"language": "eng", "title": ""}}]
+        sel, skipped, reason = select_embedded_stream(streams, ["chi", "zho"])
+        self.assertEqual(sel["index"], 4)
+        self.assertEqual(reason, "language_fallback_first_non_sign")
+        self.assertEqual(skipped[0]["why"], "disposition_forced")
+
+    def test_skips_signs_titled_track(self):
+        streams = [{"index": 4, "tags": {"language": "eng", "title": "Signs & Songs"}},
+                   {"index": 18, "tags": {"language": "chi", "title": "Simplified"}}]
+        sel, skipped, reason = select_embedded_stream(streams, ["chi", "zho"])
+        self.assertEqual(sel["index"], 18)
+        self.assertEqual(skipped[0]["why"], "title_keyword:sign")
+
+    def test_falls_back_to_first_survivor_without_language_match(self):
+        streams = [{"index": 7, "tags": {"language": "ger", "title": ""}},
+                   {"index": 8, "tags": {"language": "spa", "title": ""}}]
+        sel, _, reason = select_embedded_stream(streams, ["chi", "zho"])
+        self.assertEqual(sel["index"], 7)
+        self.assertEqual(reason, "language_fallback_first_non_sign")
+
+    def test_last_resort_when_everything_looks_like_signs(self):
+        streams = [{"index": 3, "tags": {"language": "eng", "title": "Forced"},
+                    "disposition": {"forced": 1}},
+                   {"index": 4, "tags": {"language": "eng", "title": "Signs"}}]
+        sel, skipped, reason = select_embedded_stream(streams, ["chi", "zho"])
+        self.assertEqual(sel["index"], 3)
+        self.assertEqual(reason, "last_resort_all_look_like_signs")
+        self.assertEqual(len(skipped), 2)  # one by disposition, one by title keyword
 
 
 class TestWorkspaceDoctor(unittest.TestCase):

@@ -77,7 +77,7 @@ python3 scripts/workspace.py doctor
 
 probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随后通过 `AskUserQuestion` 询问用户：
 - **外挂字幕**（一级）：在 `materials/` 中检出 `.srt`/`.ass`。
-- **内嵌软字幕流**（二级）：用 ffmpeg 抽取（要求 `ffprobe_available: true`）。
+- **内嵌软字幕流**（二级）：用 ffmpeg 抽取（要求 `ffprobe_available: true`）。多语言轨时自动**优先用户语言**（`--lang`，默认 `chi,zho,chs,cht,zh`），并自动跳过 Forced / Signs / 歌曲类字幕牌轨（每条跳过都有 stderr 告警）；最终选择与被跳过的轨记录在 extracted.json 的 `embedded_stream` 字段备查。
 - **硬字幕 OCR**（三级）：望言 OCR MCP（`POST /import → /predet → /pipeline → /export`）。OCR 完成后由你把导出文本按规范 schema 落盘到 `.cache/subtitles/extracted.json`——`{"source_tier": "TIER_3_HARDCODED_OCR", "video_path": …, "items": [{"index": 1, "start_ms": …, "end_ms": …, "text": …}, …]}`（index 从 1 连续递增，时间用毫秒整数）。后续所有阶段只认这个文件。
 - 🛑 **快速失败**：纯画面素材且无任何字幕来源 → 运行 `python3 scripts/workspace.py check-subtitles --mode none`，它以退出码 5 结束。绝不编造台词。
 
@@ -186,6 +186,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 视频无音频流 | 工作单 `status=no_audio_stream` | 直接 `merge --empty-fallback`；对白只存在于字幕层，流水线不受影响 |
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
+| 内嵌轨疑似纯字幕牌（SIGN/Forced） | extracted.json 的 `embedded_stream.reason=last_resort_all_look_like_signs`，或行文本多为画面文字 | 用 `--lang` 指定其他语言轨重抽；多轨源可显式映射对白轨重剪（`ffmpeg -map 0:<idx>`） |
 | 缺 FFmpeg | scene_detect 退出码 3 / doctor 退出码 3 | 停止，原样上报，绝不借用无关 MCP |
 | 分组器 `forced_dialogue_cuts > 0` | stderr WARN | 可能出现台词中途切场；检查字幕对齐 / `--max-scenes` 余量 |
 | 镜头数超出 `40 × max_scenes` | （旧版会静默塌缩成 1 场） | 求解窗已自动加宽至 `⌈镜头数 / max_scenes⌉` 自愈；若仍见"collapse into a single scene" WARN，调大 `--max-scenes` |
