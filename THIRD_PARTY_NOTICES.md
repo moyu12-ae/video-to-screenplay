@@ -30,6 +30,17 @@ license texts are preserved in `licenses/`.
   workspace-contained temp files; no OSS upload ladder (audio parts are
   pre-split to fit the inline budget); no MCP plumbing.
 
+- **Additional v0.5 patterns referenced from the same project's skills** (no
+  code copied, Apache-2.0 attribution extends to these):
+  - the `omni-memory` skill's SW_PROMPT evidence-schema shape (dual visual/audio
+    JSON with anti-hallucination rules and a time-basis declaration), its
+    anonymous-entity idea (describe people by visible epithets, defer naming)
+    and its 5 s inter-window overlap;
+  - the `omni-chatcut` movie-commentary skill's evidence_refs validation idea
+    (→ our per-scene coverage check) and relative→absolute timestamp mapping;
+  - the `omni_av_caption` tool's Visible-Text section shape and the
+    1 fps / 448² / ~9 min-per-10 MB inline capacity figures.
+
 ## NarratoAI — MIT License (© 2024 linyq)
 
 - Source: https://github.com/linyqh/NarratoAI
@@ -37,3 +48,10 @@ license texts are preserved in `licenses/`.
   with immediate failure on auth errors; failure isolation across batch items
   (one failed part never aborts the rest); per-item response caching for
   resume-after-interruption. Acknowledged in EVOLUTION.md.
+
+## narrator-ai-cli-skill — MIT License
+
+- Source: https://github.com/NarratorAI-Studio/narrator-ai-cli-skill
+- **Posture referenced, no code copied**: cost preview + explicit user
+  confirmation before launching a multi-call perception pass (our stage 3.7
+  gate). Acknowledged in EVOLUTION.md.

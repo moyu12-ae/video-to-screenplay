@@ -51,6 +51,12 @@ BACKOFF_CAP_SEC = 60.0
 MAX_TOKENS = 65536
 TEMPERATURE = 0.3              # matches upstream call_omni_json
 
+# Video understanding (v0.5) - defaults mirror upstream omni_video_part.
+DEFAULT_VIDEO_FPS = 1.0
+DEFAULT_VIDEO_MAX_PIXELS = 200704            # ~448²
+VIDEO_HEIGHT_CRF_LADDER = ((480, 26), (432, 30), (360, 34), (288, 40))
+VIDEO_AUDIO_KBPS = 96
+
 # The endpoint caps ONE inline media item at 10 MB of base64; keep the raw
 # payload at 3/4 of that (base64 expansion) minus 3% slack - upstream sizing.
 INLINE_RAW_BUDGET_BYTES = int(10_000_000 * 3 / 4 * 0.97)   # ~7.27 MB
@@ -440,6 +446,106 @@ def _coerce_segment(seg: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             pass
     return out
+
+
+# ---------------------------------------------------------------------------
+# video understanding (v0.5) - scene-grounded AV notes
+# ---------------------------------------------------------------------------
+
+def fit_video(video_path: str, budget: int = INLINE_RAW_BUDGET_BYTES) -> Tuple[Path, str]:
+    """Re-encode a video segment down a height/CRF ladder until the MP4 fits the
+    inline budget. Returns (payload_path, format); the input file is never
+    modified. Temp outputs land beside the source and are removed by the caller
+    when they are not the returned payload."""
+    src = Path(video_path)
+    if src.stat().st_size <= budget:
+        return src, "mp4"
+    last_err = "unknown error"
+    for height, crf in VIDEO_HEIGHT_CRF_LADDER:
+        out = src.parent / f".fitv_{src.stem}_{height}.mp4"
+        try:
+            proc = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src),
+                 "-vf", f"scale=-2:{height}", "-c:v", "libx264", "-crf", str(crf),
+                 "-preset", "veryfast", "-c:a", "aac", "-b:a", f"{VIDEO_AUDIO_KBPS}k",
+                 "-ar", "16000", "-ac", "1", "-movflags", "+faststart", str(out)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=FFMPEG_TIMEOUT_SEC, check=False)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg video fit timed out")
+        if proc.returncode == 0 and out.is_file():
+            size = out.stat().st_size
+            if size <= budget:
+                return out, "mp4"
+            last_err = f"{height}p/crf{crf} still {size} bytes over budget"
+        else:
+            lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+            last_err = lines[-1] if lines else "unknown ffmpeg error"
+    raise ValueError(f"video segment cannot fit the inline budget: {last_err}")
+
+
+def build_video_part(payload_path: str, *, fps: Optional[float] = None,
+                     max_pixels: Optional[int] = None,
+                     use_audio_in_video: bool = True) -> Dict[str, Any]:
+    """DashScope inline video part. fps/max_pixels MUST sit at the part's top
+    level - the endpoint only honors them there (verified against the reference
+    omni client)."""
+    b64 = base64.b64encode(Path(payload_path).read_bytes()).decode("ascii")
+    part: Dict[str, Any] = {
+        "type": "video_url",
+        "video_url": {"url": f"data:video/mp4;base64,{b64}"},
+        "fps": float(fps if fps else DEFAULT_VIDEO_FPS),
+        "max_pixels": int(max_pixels if max_pixels else DEFAULT_VIDEO_MAX_PIXELS),
+    }
+    if use_audio_in_video:
+        part["use_audio_in_video"] = True
+    return part
+
+
+def understand_video_segment(video_path: str, *, prompt: str, api_key: Optional[str] = None,
+                             base_url: Optional[str] = None, model: Optional[str] = None,
+                             fps: Optional[float] = None, max_pixels: Optional[int] = None,
+                             max_tokens: int = 8192, temperature: float = 0.1,
+                             timeout_sec: Optional[float] = None, attempts: Optional[int] = None,
+                             log: Any = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """One video segment in, parsed evidence JSON out (one repair round when the
+    reply is not valid JSON). Returns (data, meta); meta carries provenance the
+    caller may keep or drop."""
+    src = Path(video_path)
+    if not src.is_file():
+        raise OmniError("bad_request", detail=f"video segment not found: {src.name}")
+    payload, fmt = fit_video(str(src))
+    try:
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": [
+            build_video_part(str(payload), fps=fps, max_pixels=max_pixels),
+            {"type": "text", "text": prompt}]}]
+        text, usage = call_omni_chat(messages, api_key=api_key, base_url=base_url, model=model,
+                                     max_tokens=max_tokens, temperature=temperature,
+                                     timeout_sec=timeout_sec, attempts=attempts, log=log)
+        try:
+            data = extract_json_payload(text)
+        except ValueError:
+            repair_messages = messages + [{"role": "user", "content":
+                                           "Your previous reply was not valid JSON. "
+                                           "Output ONLY the JSON object, nothing else."}]
+            text, usage = call_omni_chat(repair_messages, api_key=api_key, base_url=base_url,
+                                         model=model, max_tokens=max_tokens, temperature=0.0,
+                                         timeout_sec=timeout_sec, attempts=attempts, log=log)
+            data = extract_json_payload(text)  # still bad -> ValueError to the caller
+        meta = {
+            "backend": "direct_api",
+            "model": model or resolve_model(),
+            "video_encoding": fmt,
+            "endpoint_host": urllib.parse.urlsplit(resolve_base_url(base_url)).hostname,
+            "usage": usage,
+        }
+        return data, meta
+    finally:
+        if payload != src:
+            try:
+                payload.unlink()
+            except OSError:
+                pass
 
 
 def diarize_audio_file(audio_path: str, *, api_key: Optional[str] = None,

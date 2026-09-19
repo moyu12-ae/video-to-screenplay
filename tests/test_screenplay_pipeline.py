@@ -44,6 +44,16 @@ import omni_client
 import workspace
 from align_timeline import infer_av_relationship
 from subtitle_extractor import select_embedded_stream
+from av_understand import (
+    build_prompt,
+    cmd_merge as av_merge,
+    cmd_prepare as av_prepare,
+    cmd_run as av_run,
+    parse_note,
+    plan_segments,
+    scene_coverage,
+)
+import av_understand as av_understand_module
 
 
 class TestSpeakerPrefixParsing(unittest.TestCase):
@@ -335,12 +345,24 @@ class TestSceneManifestBuilder(unittest.TestCase):
             }, ensure_ascii=False), encoding="utf-8")
             (kf / "shot_0001_000000ms.jpg").write_bytes(b"\xff\xd8fake")
             (kf / "shot_0002_003000ms.jpg").write_bytes(b"\xff\xd8fake")
+            # Stage 3.7 evidence: present -> injected into the scene evidence pack
+            (visual / "av_notes.json").write_text(json.dumps({
+                "schema": "vts-av-notes/v1",
+                "scene_notes": [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 6000,
+                                 "covered_pct": 100.0,
+                                 "segments": [{"start_ms": 0, "end_ms": 6000,
+                                               "visual": {"caption": "雨夜码头", "actions": [], "camera": [],
+                                                          "scene_transition": "无"},
+                                               "visible_text": [], "acoustic": {}, "uncertain": []}]}]
+            }, ensure_ascii=False), encoding="utf-8")
 
             manifest = build_manifest(ws, max_keyframes=8)
             self.assertEqual(manifest["total_scenes"], 1)
             self.assertEqual(manifest["bible_names"], ["菈菈", "茉里", "面试的店主"])
             self.assertIn("[[SUB:", manifest["instructions"])
             scene = manifest["scenes"][0]
+            self.assertIsNotNone(scene["av_notes"])
+            self.assertEqual(scene["av_notes"]["covered_pct"], 100.0)
             # 640px thumbs are generated for the writer (cv2 present in dev env)
             self.assertTrue(scene["keyframes_thumbs"])
             self.assertTrue(all(k.startswith(str(ws)) for k in scene["keyframes_thumbs"]))
@@ -705,6 +727,194 @@ class TestWorkspaceDoctor(unittest.TestCase):
         report = json.loads(out)["report"]
         self.assertFalse(report["ffmpeg"]["ready"])
         self.assertFalse(report["ffprobe"]["ready"])
+
+
+class TestAvUnderstand(unittest.TestCase):
+    """Stage 3.7 pure planning + cmd_run/prepare integration (no network, no ffmpeg)."""
+
+    def test_plan_segments_splits_with_overlap_and_tail_fold(self):
+        segs = plan_segments([{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 200_000}])
+        self.assertEqual([(s["start_ms"], s["end_ms"]) for s in segs],
+                         [(0, 90_000), (85_000, 200_000)])  # 5s overlap; 25s tail folded
+
+    def test_plan_segments_short_scene_single_window(self):
+        segs = plan_segments([{"scene_id": "SCENE_01", "start_ms": 30_000, "end_ms": 90_000}])
+        self.assertEqual([(s["start_ms"], s["end_ms"]) for s in segs], [(30_000, 90_000)])
+
+    def test_plan_segments_never_cross_scene_boundaries(self):
+        segs = plan_segments([{"scene_id": "A", "start_ms": 0, "end_ms": 100_000},
+                              {"scene_id": "B", "start_ms": 100_000, "end_ms": 120_000}])
+        self.assertTrue(all(s["scene_id"] in ("A", "B") for s in segs))
+        self.assertEqual([s["end_ms"] for s in segs if s["scene_id"] == "A"], [100_000])
+        self.assertEqual([s["start_ms"] for s in segs if s["scene_id"] == "B"], [100_000])
+
+    def test_parse_note_shifts_to_absolute_and_drops_garbage(self):
+        note = parse_note({
+            "visual": {"caption": "雨夜", "scene_transition": "硬切",
+                       "actions": [{"start": 1.5, "end": 3.0, "who": "红衣女子", "what": "拔刀"},
+                                   "not-a-dict",
+                                   {"start": "abc", "end": 9},
+                                   {"start": 5.0, "end": 2.0, "who": "x", "what": "倒序"}],
+                       "camera": [{"start": 0, "end": 4, "movement": "缓推"}]},
+            "visible_text": "should be a list",
+            "acoustic": {"events": [{"start": 2.2, "what": "雷声"}], "music_mood": "紧张"},
+            "uncertain": [7, "第 40s 附近人物身份无法确认"],
+        }, 420_000, 510_000)
+        self.assertEqual(note["visual"]["caption"], "雨夜")
+        self.assertEqual(note["visual"]["actions"],
+                         [{"who": "红衣女子", "what": "拔刀", "start": 421_500, "end": 423_000}])
+        self.assertEqual(note["visual"]["camera"][0]["start"], 420_000)
+        self.assertEqual(note["visible_text"], [])
+        self.assertEqual(note["acoustic"]["events"][0]["start"], 422_200)
+        self.assertEqual(note["acoustic"]["music_mood"], "紧张")
+        self.assertEqual(note["uncertain"], ["第 40s 附近人物身份无法确认"])
+
+    def test_parse_note_survives_non_dict_input(self):
+        for garbage in (None, [], "x", 42):
+            note = parse_note(garbage, 0, 1_000)
+            self.assertEqual(note["visual"]["actions"], [])
+            self.assertEqual(note["acoustic"]["events"], [])
+
+    def test_scene_coverage_union(self):
+        scene = {"start_ms": 0, "end_ms": 100_000}
+        self.assertEqual(scene_coverage(scene, [(0, 50_000), (50_000, 100_000)])[0], 100.0)
+        self.assertEqual(scene_coverage(scene, [(0, 60_000), (55_000, 90_000)])[0], 90.0)
+        self.assertEqual(scene_coverage(scene, [(0, 40_000), (80_000, 100_000)])[0], 60.0)
+        self.assertEqual(scene_coverage(scene, [])[0], 0.0)
+        self.assertEqual(scene_coverage(scene, [(200_000, 300_000)])[0], 0.0)  # outside span
+
+    def test_prompt_declares_time_basis_and_name_ban(self):
+        prompt = build_prompt(420_000, 510_000)
+        self.assertIn("0..90.0", prompt)
+        self.assertIn("420.0..510.0", prompt)
+        self.assertIn("NEVER output a real name", prompt)
+        self.assertIn("Do NOT transcribe spoken dialogue", prompt)
+        self.assertIn("Chinese", prompt)
+
+    def _make_ws(self, scenes, segments):
+        handle = tempfile.TemporaryDirectory()
+        self.addCleanup(handle.cleanup)
+        root = Path(handle.name)
+        av_dir = root / ".cache" / "av"
+        av_dir.mkdir(parents=True)
+        (root / ".cache" / "visual").mkdir(parents=True)
+        (root / ".cache" / "visual" / "scenes.json").write_text(
+            json.dumps({"scenes": scenes}, ensure_ascii=False), encoding="utf-8")
+        work = {"status": "ready", "segment_seconds": 90.0, "overlap_sec": 5.0,
+                "scenes": scenes, "segments": []}
+        for i, (sid, s_ms, e_ms) in enumerate(segments):
+            work["segments"].append({"file": f"av/seg_{i:03d}.mp4", "scene_id": sid,
+                                     "start_ms": s_ms, "end_ms": e_ms,
+                                     "output": f"av/av_note_{i:03d}.json"})
+            (av_dir / f"seg_{i:03d}.mp4").write_bytes(b"\x00" * 32)
+        (av_dir / "av_workorder.json").write_text(
+            json.dumps(work, ensure_ascii=False, indent=2), encoding="utf-8")
+        return root, av_dir
+
+    @staticmethod
+    def _fake_note():
+        return {"visual": {"caption": "雨夜", "actions": [{"start": 1.0, "end": 2.0,
+                                                          "who": "红衣女子", "what": "转身"}],
+                            "camera": [], "scene_transition": "无"},
+                "visible_text": [], "acoustic": {"events": [], "music_mood": "无"},
+                "uncertain": []}
+
+    def _run(self, ws, force=False):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}):
+                    av_run(str(ws), force=force)
+        return ctx.exception.code, err.getvalue()
+
+    def test_cmd_prepare_writes_workorder_and_segments(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "materials").mkdir()
+            (ws / "materials" / "clip.mkv").write_bytes(b"\x00")
+            (ws / ".cache").mkdir()
+            (ws / ".cache" / "visual").mkdir()
+            (ws / ".cache" / "visual" / "scenes.json").write_text(json.dumps(
+                {"scenes": [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 200_000}]}),
+                encoding="utf-8")
+            err = io.StringIO()
+
+            def fake_cut(video, out_path, s_ms, e_ms):
+                Path(out_path).write_bytes(b"\x00" * 32)
+
+            with mock.patch.object(av_understand_module, "require_binaries", lambda: None), \
+                 mock.patch.object(av_understand_module, "locate_video",
+                                   return_value=str(ws / "materials" / "clip.mkv")), \
+                 mock.patch.object(av_understand_module, "_cut_segment", side_effect=fake_cut), \
+                 contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    av_prepare(str(ws), 90.0, None)
+            self.assertEqual(ctx.exception.code, 0)
+            work = json.loads((ws / ".cache" / "av" / "av_workorder.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(work["segments"]), 2)  # 200s scene -> 2 segments
+            self.assertTrue((ws / ".cache" / "av" / "seg_000.mp4").is_file())
+
+    def test_cmd_run_writes_notes_and_av_notes_json(self):
+        ws, av_dir = self._make_ws(
+            [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 60_000}],
+            [("SCENE_01", 0, 60_000)])
+        with mock.patch.object(omni_client, "understand_video_segment",
+                               return_value=(self._fake_note(), {"backend": "direct_api"})) as stub:
+            code, err = self._run(ws)
+        self.assertEqual(code, 0)
+        stub.assert_called_once()
+        self.assertTrue((av_dir / "av_note_000.json").is_file())
+        notes = json.loads((ws / ".cache" / "visual" / "av_notes.json").read_text(encoding="utf-8"))
+        self.assertEqual(notes["schema"], "vts-av-notes/v1")
+        self.assertEqual(notes["scene_notes"][0]["covered_pct"], 100.0)
+        self.assertEqual(notes["scene_notes"][0]["segments"][0]["visual"]["actions"][0]["start"],
+                         1_000)  # local 1.0s -> absolute 1000ms
+
+    def test_cmd_run_missing_key_exits_8(self):
+        ws, _ = self._make_ws([{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 60_000}],
+                              [("SCENE_01", 0, 60_000)])
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+                    av_run(str(ws))
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_cmd_run_failure_does_not_stop_other_segments(self):
+        ws, av_dir = self._make_ws(
+            [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 120_000}],
+            [("SCENE_01", 0, 90_000), ("SCENE_01", 85_000, 120_000)])
+        with mock.patch.object(omni_client, "understand_video_segment",
+                               side_effect=[omni_client.OmniError("server", 502),
+                                            (self._fake_note(), {"backend": "direct_api"})]):
+            code, err = self._run(ws)
+        self.assertEqual(code, 7)
+        self.assertFalse((av_dir / "av_note_000.json").exists())
+        self.assertTrue((av_dir / "av_note_001.json").exists())
+        self.assertIn("[ERROR]", err)
+
+    def test_cmd_run_skips_valid_notes_without_key(self):
+        ws, av_dir = self._make_ws(
+            [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 60_000}],
+            [("SCENE_01", 0, 60_000)])
+        (av_dir / "av_note_000.json").write_text(
+            json.dumps(self._fake_note()), encoding="utf-8")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+                    av_run(str(ws))
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("[SKIP]", err.getvalue())
+
+    def test_cmd_merge_missing_note_exits_7(self):
+        ws, _ = self._make_ws(
+            [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 60_000}],
+            [("SCENE_01", 0, 60_000)])  # no note file written
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(io.StringIO()):
+                av_merge(str(ws))
+        self.assertEqual(ctx.exception.code, 7)
 
 
 if __name__ == "__main__":

@@ -69,6 +69,10 @@ WRITING_CONTRACT = """\
    △ 铜镜只剩一点将熄的微光。云铮的音容浮现在光晕里。
    △ 小满双手按上镜面——镜的另一侧，一只涂着黑甲的手（影卫）与她隔镜相抵。青金的光纹在镜面炸开。
    禁止「两人交谈」「气氛尴尬」这类空泛句。
+   若本场带 av_notes（声画理解证据）：△ 优先取材其中真实可见的动作/运镜/音效/
+   屏显文字（时间码对得上的优先），关键帧管构图与人物外观；av_notes 里的描述
+   是目击证据，绝不当台词写进正文，其中人物一律是描述性称呼、以台词与
+   characters_manifest 的称呼为准。
 4. 角色名只能来自 bible.characters / characters_manifest / 本场 dialogues 里出现过的称呼；
    认不出的人用描述性指称（路人（男）/神秘人物），绝不发明专有名词。
 5. 视听绝对性：**目击者原则**——只写画面可见、耳朵可闻的内容；禁止心理描写与回忆
@@ -220,6 +224,16 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
     if not exemplars:
         sys.stderr.write("[INFO] No exemplar screenplays found next to the workspace; writer relies on the style card only.\n")
 
+    # Stage 3.7 evidence (optional): scene-grounded AV notes from av_understand.py
+    av_doc = load_json(ws / ".cache" / "visual" / "av_notes.json") or {}
+    av_by_scene = {str(n.get("scene_id")): n for n in (av_doc.get("scene_notes") or [])
+                   if isinstance(n, dict) and n.get("scene_id")}
+    if av_by_scene:
+        sys.stderr.write(f"[INFO] AV understanding notes loaded for {len(av_by_scene)} scene(s); "
+                         "they are WRITING EVIDENCE - never dialogue text.\n")
+    else:
+        sys.stderr.write("[INFO] No av_notes.json - writer falls back to keyframes-only evidence.\n")
+
     drafts_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_scenes: List[Dict[str, Any]] = []
@@ -242,6 +256,7 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
             "sequence_title": sc.get("sequence_title", ""),
             "sequence_value": sc.get("sequence_value", ""),
             "keyframes_thumbs": make_thumbs(originals, thumbs_dir / f"scene_{idx:02d}", THUMB_WIDTH),
+            "av_notes": av_by_scene.get(sid),
             "child_shot_count": sc.get("child_shot_count"),
             "dialogues": dialogues_by_scene.get(sid, []),
             "draft_path": str(draft_path),

@@ -1,6 +1,6 @@
 ---
 name: video-to-screenplay
-description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门与 API key 前置检查门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
+description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门与 API key 前置检查门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、可选声画理解 pass（Omni 看视频产出动作/镜头/声学/屏显文字证据）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
 ---
 
 # 视频转剧本流水线（`video-to-screenplay`）
@@ -20,12 +20,17 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
     ├── visual/
     │   ├── shots.json             物理镜头切点 + 关键帧文件名
     │   ├── scenes.json            宏场景（LGSS 式动态规划求解）
+    │   ├── av_notes.json          声画理解逐场证据（阶段 3.7，可选）
     │   └── keyframes/             镜头缩略图（shot_XXXX_XXXXXXms.jpg）
     ├── audio/
     │   ├── speakers.json          声学说话人标签 + characters_manifest
     │   ├── diarize_workorder.json 说话人工作单（prepare 产物，指引 run / MCP 调用）
     │   ├── source_audio*.m4a      16k 单声道抽取音频（>50 分钟自动分片）
     │   └── omni_diarized*.json    声学分离原始返回（run 直连或 MCP，证据，只读）
+    ├── av/
+    │   ├── av_workorder.json      声画理解工作单（prepare 产物）
+    │   ├── seg_*.mp4              场景段 payload（480p CRF 阶梯转码）
+    │   └── av_note_*.json         每段原始模型证据（只读）
     ├── alignment/
     │   ├── aligned_timeline.json  镜头↔台词主对齐（每条台词恰好分配一次）
     │   └── scene_manifest.json    场景证据包 + 写作契约（阶段 4）
@@ -54,9 +59,11 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
      ├── narrative_outline.py → 工作单 → agent 写 narrative_structure.json → 校验
      │   （grouper 按序列墙分段、段内 DP 精切；无大纲则整体平切）
      ├── align_timeline.py         → aligned_timeline.json（每条台词只分配一次，取最大重叠）
+     │  阶段 3.7：声画理解（可选，推荐——让 AI 真正看视频再写 △）
+     ├── av_understand.py  prepare → run → merge → av_notes.json（动作/镜头/声学/屏显文字证据）
      │  阶段 4：场景写作（多模态 LLM 撰写真实剧本，分块可续跑）
      ├── build_scene_manifest.py   → scene_manifest.json（证据包 + 写作契约）
-     ├── agent 读关键帧+台词 → 写 scene_drafts/scene_XX.md（台词以 [[SUB:n]] 占位）
+     ├── agent 读关键帧+av_notes+台词 → 写 scene_drafts/scene_XX.md（台词以 [[SUB:n]] 占位）
      │  阶段 5：逐字拼装与成稿
      └── splice_screenplay.py      → output/<标题>_影视文学剧本.md
 ```
@@ -142,21 +149,34 @@ python3 scripts/narrative_outline.py --workspace "<ws>"
 
 🔴 **检查点**：`total_macro_scenes` 合理（典型 8~35），`aligned_timeline.json` 覆盖全部台词。
 
+### 阶段 3.7 —— 声画理解（可选，推荐：让 AI 真正看视频再写 △）
+
+```bash
+python3 scripts/av_understand.py --workspace "<ws>" prepare   # 切段 + 转码，exit 0
+python3 scripts/av_understand.py --workspace "<ws>" run       # 直连逐段理解 + merge，缺 key exit 8
+```
+
+- **prepare**：读 scenes.json，>90 秒的场景切成 ≤90 秒段（`--segment-seconds` 可调；段间 5 秒重叠、短尾折叠、段不跨场景），逐段转码 480p/CRF 阶梯 MP4（超 inline 预算自动降档），写 `av_workorder.json`。**启用前用 AskUserQuestion 预告成本**（实测校准，ep5 10 分钟片/35 段：每段 ~38 秒墙钟、~5.4k tokens，合计 ~3.2× 片长墙钟、~190k tokens——段数 = 工作单 segments 数；**后台执行**），经用户确认再执行。
+- **run**：逐段直连 DashScope。模型只产出四通道结构化证据——`visual.actions`（谁做了什么）、`visual.camera`（景别/运镜）、`visible_text`（屏显文字逐字+起止）、`acoustic`（音效事件+音乐情绪）——prompt 里**明令不做台词转写、不给人物起名**（人物一律描述性称呼如"红衣女子"，命名权归场景写作 pass）；不确定之处进 `uncertain`。逐段断点续跑、单片失败不阻塞（`--force` 全部重做）。
+- **merge（run 内置）**：段内相对秒 +start 映射回源时间轴 → 按场景聚合 → **覆盖率校验**（<100% 的场景 WARN，缺口区间由写作者回退关键帧证据）→ `.cache/visual/av_notes.json`。
+- 🔴 **红线**：av_notes 是**证据层**——绝不成为台词文本（台词永远 `[[SUB:n]]` 逐字来自字幕）、绝不改判声学归属、绝不替代关键帧。
+- 跳过本 pass：阶段 4 退回纯关键帧证据，流水线其余不受影响。
+
 ### 阶段 4 —— 场景写作（由 LLM 撰写真正的剧本，分块可续跑）
 
 ```bash
 python3 scripts/build_scene_manifest.py --workspace "<ws>"
 ```
 
-manifest 是逐场**证据包**：`keyframes_thumbs`（640px 降采样帧）、该场逐字 `dialogues`（各带 `sub_index` + 时间码）、`bible_names`，以及 `exemplars`（前几集剧本——读其中一份作为格式参照）。对每个 `draft_status == "missing"` 的场景：
+manifest 是逐场**证据包**：`keyframes_thumbs`（640px 降采样帧）、该场逐字 `dialogues`（各带 `sub_index` + 时间码）、`av_notes`（若跑过阶段 3.7：逐段动作/运镜/声学/屏显文字证据，时间码已映射回源时间轴）、`bible_names`，以及 `exemplars`（前几集剧本——读其中一份作为格式参照）。对每个 `draft_status == "missing"` 的场景：
 
-1. `Read` 它的缩略图、台词，以及（如有）上一场 `scene_(N-1).md` 的结尾以保持连贯。
+1. `Read` 它的缩略图、av_notes（如有）、台词，以及（如有）上一场 `scene_(N-1).md` 的结尾以保持连贯。
 2. 写 `.cache/scene_drafts/scene_XX.md` —— 该场真正的场号制剧本文本：
    - `## 场 N【地点·事件标题】` H2 场头（标题由你起名；时间码由拼装器注入行尾，不要手写 TC）+ `**内景/外景·时辰**｜注记` 时空行 + `**人物：**` 行；不写 `> 概要：` 引用行；
    - 台词行按说话人合并：同一角色连续说话写一行、句间用全角斜杠——`**角色名**（提示）：[[SUB:2]]／[[SUB:3]]`；说话人切换才另起一行；
    - `△` 动作段是导演笔记，织在台词之间：演出指示、表演指导、镜头强调——写光、物、身体、声音；人物首次上镜写作 `△【角色】（特征）`；
    - `（画外）/【内心独白】` 括注、`△【插入：…】` 闪回、`（字幕卡：…）` 字幕。
-3. 硬规则：**绝不复打台词**——只允许占位符，每个 `sub_index` 恰好一次、按序出现（顺序倒置现在是 `splice` 的致命错误，会点名出错的两条下标）；角色名只能来自 bible/manifest/台词中的称呼（陌生人物用描述性标签，绝不杜撰专有名词）；**目击者原则**——只写摄影机能拍到、录音机能录到的内容，零心理描写与回忆（不写"她想起……心中悔恨"，写"她动作僵住，攥紧拳头，指甲陷进肉里"——演员能演、摄影机能拍）；**Notnot 原则**——写"有什么"不写"没什么"，禁否定式动作句（不写"他没有回答"，写"他保持沉默"）；△ 禁止"两人交谈"式空泛句。
+3. 硬规则：**绝不复打台词**——只允许占位符，每个 `sub_index` 恰好一次、按序出现（顺序倒置现在是 `splice` 的致命错误，会点名出错的两条下标）；角色名只能来自 bible/manifest/台词中的称呼（陌生人物用描述性标签，绝不杜撰专有名词）；**目击者原则**——只写摄影机能拍到、录音机能录到的内容，零心理描写与回忆（不写"她想起……心中悔恨"，写"她动作僵住，攥紧拳头，指甲陷进肉里"——演员能演、摄影机能拍）；**Notnot 原则**——写"有什么"不写"没什么"，禁否定式动作句（不写"他没有回答"，写"他保持沉默"）；△ 禁止"两人交谈"式空泛句；若本场带 av_notes——△ 优先取材其中真实可见的动作/运镜/音效/屏显文字（时间码对得上的优先），av_notes 的描述绝不当台词写进正文，其中人物是描述性称呼、真名以台词与 characters_manifest 为准。
 
 完整契约内嵌于 `manifest.instructions`。随时可重跑 builder——它会报告 `drafts_written` / `drafts_missing`（检查点/续跑）。
 
@@ -192,6 +212,9 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
 | 内嵌轨疑似纯字幕牌（SIGN/Forced） | extracted.json 的 `embedded_stream.reason=last_resort_all_look_like_signs`，或行文本多为画面文字 | 用 `--lang` 指定其他语言轨重抽；多轨源可显式映射对白轨重剪（`ffmpeg -map 0:<idx>`） |
+| 声画理解无 key / 用户选择跳过 | av run **退出码 8** / AskUserQuestion 选跳过 | 阶段 4 退回纯关键帧证据，流水线其余不受影响 |
+| 声画理解单段调用失败 | av run 逐段 `[ERROR]` 不阻塞其余 | 重跑 `run`（断点续跑只补缺）；或放弃该 pass |
+| 场景声画覆盖缺口 | av_notes.json 中该场景 `covered_pct<100` + merge WARN | 缺口区间回退关键帧证据；必要时 `--segment-seconds` 调小重切 `prepare` |
 | 缺 FFmpeg | scene_detect 退出码 3 / doctor 退出码 3 | 停止，原样上报，绝不借用无关 MCP |
 | 分组器零宏场景 | **退出码 1** 并报出镜头/台词数 | 空 scenes.json 会让成稿静默为空：检查 shots.json 时间码；层级模式下检查大纲 sub 区间是否覆盖全片 |
 | 台词落在所有镜头之外 | 对齐器 WARN + `cues_nearest_shot_fallback` | 无需干预：自动绑到最近镜头；若计数异常偏高，说明切镜时间码或字幕时间基有问题 |
@@ -211,6 +234,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 为无声画面编造台词 | 硬性拒绝；无字幕 → 不开工 |
 | 把暂定标签渲染成真名 | `SPEAKER_*`（含声学 `SPEAKER_A*`）/ 未归属 → `人物`，直到场景理解 pass 给出命名 |
 | 用 Omni 转写文本代替字幕台词 | 转写仅作 `text_agreement` 证据；台词一律 `[[SUB:n]]` 逐字来自字幕 |
+| 把 av_notes 的描述当台词写进正文 | av_notes 是目击证据层——台词永远 `[[SUB:n]]` 逐字来自字幕；其中人物是描述性称呼，真名以台词/manifest 为准 |
 | 把 API key 写进代码/命令行/证据文件 | key 只从环境变量读（无 key 时 run 以退出码 8 拒绝）；日志只含异常类型+状态码+主机名 |
 | 让降级产物冒充声学结论 | `merge --empty-fallback` 写出的 `speakers.json` 必须自报 `acoustic_clustering_enabled: false` + `backend: "none"`；下游判断说话人列是否可用只看这两个字段，绝不靠"有没有名字"猜 |
 | 在对齐阶段丢弃低重叠台词 | 每条台词必须有着落（重叠不足则绑最近镜头并上报）：拼装器把"从未被认领"判为致命，丢一条就等于把整集卡死在最后一步 |

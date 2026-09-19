@@ -257,3 +257,42 @@
   decorative K loop, the `(10 - sec) * 3` segment cost that discards fine-grained evidence under
   ~6 s), and splitting `speaker_diarize.py` into modules — behaviour changes and a refactor, not
   bug fixes. Recorded as v0.5 candidates.
+
+## 12. v0.5.0 — AV Understanding Pass (the model actually WATCHES the video)
+
+- **Trigger**: stage 4's △ action lines were authored from static keyframes — motion, camera
+  language, sound design, BGM mood and between-lines body language were hallucinated. Qwen3.8-Omni
+  is a video model; the pipeline should let it watch before writing. (Developed in a separate
+  worktree + `feat/av-understanding` branch per user request; main stayed untouched.)
+- **Research base**: official Qwen-MM-Plugins patterns — video-memory's SW_PROMPT dual-layer
+  evidence schema + anti-hallucination rules + time-basis declaration, movie-commentary's
+  evidence_refs validation (→ our per-scene coverage check) and relative→absolute timestamp
+  mapping, omni_av_caption's Visible-Text section, and the hard constraints (250 data-URI cap,
+  ~9 min inline video per 10 MB at 1 fps/448², fps/max_pixels at part top level,
+  `use_audio_in_video`); narrator-ai-cli-skill (MIT) contributed the confirm-before-acting posture
+  (cost preview before enabling the pass).
+- **Change**: new optional stage 3.7 — `av_understand.py` (prepare/run/merge, script-driven, no
+  exit 6): scenes >90 s split into ≤90 s segments (5 s overlap, tail folding, never crossing
+  scene boundaries), each cut + transcoded down a 480p CRF ladder into the inline budget; per
+  segment one direct DashScope call returns a four-channel evidence JSON (visual.actions /
+  visual.camera / visible_text / acoustic) — dialogue transcription and character naming are
+  FORBIDDEN in the prompt (people appear as visible epithets; naming belongs to the writing pass);
+  notes map back onto the episode timeline (+start), scenes get a coverage check, gaps WARN and
+  fall back to keyframes. `omni_client.py` grows `fit_video` / `build_video_part` /
+  `understand_video_segment` (one JSON-repair round), fully backward compatible with the diarize
+  path. `build_scene_manifest.py` injects `av_notes` into each scene's evidence pack and the
+  writing contract gains the grounding rule; SKILL gains stage 3.7 + 3 failure-matrix rows +
+  1 anti-pattern row. Red line unchanged: AV notes are an EVIDENCE layer — never dialogue text,
+  never speaker re-attribution, never a keyframe replacement.
+- **Tests**: +13 (segment planning/overlap/tail-fold, absolute-time mapping incl. point sound
+  events without `end`, garbage tolerance, coverage unions, prompt contract, prepare/run/merge
+  integration with mocked calls) — 128 green. The suite caught two real bugs pre-commit: point
+  events (sound cues with no `end`) were silently dropped, and merge re-parsed already-absolute
+  notes (double timeline shift) — fixed by storing the RAW model reply on disk and parsing exactly
+  once at merge.
+- **Calibration (ep5 10-min clip, 35 scenes, all successful, zero retries)**: ~38 s wall clock per
+  call, ~5.4k tokens per call (prompt ~2.2k of which ~1.5k video tokens; completion ~3.2k mostly
+  reasoning), 190k tokens total for 10 minutes of episode, ~3.2× audio-length wall clock (35
+  heuristic-granularity scenes; a narrative outline / numpy visual affinity produces coarser
+  scenes and fewer calls). Evidence yield: 181 action entries + 56 on-screen-text entries, every
+  scene covered 100 %.
