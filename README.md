@@ -17,11 +17,11 @@ The key powers Qwen3.8-Omni acoustic speaker diarization. Stage 1 preflight-chec
 ## How It Works
 
 1. **Clean Workspace** — `materials/` (read-only inputs) → `.cache/` (disposable intermediates) → `output/` (final screenplay only).
-2. **Subtitle Gate** — external file → embedded soft stream → OCR gateway; pure visual footage is hard-refused (exit 5). The pipeline never invents dialogue.
-3. **Dual-Track Extraction** — FFmpeg shot cuts + keyframes run concurrently with subtitle ingestion and **acoustic speaker diarization** (ffmpeg extracts 16 kHz mono audio → a direct DashScope client streams the same Qwen3.8-Omni diarization request — code-owned retries/backoff, per-part resume, no client tool-window limits; MCP `omni_multi_speaker_asr` remains as a fallback → deterministic max-overlap binding to subtitle lines). Multi-part runs snap cut points to silence, overlap adjacent parts by ±3 s, and reconcile cross-part identities only on co-occurrence evidence (the same utterance diarized in both parts — union-find, prefer splitting over wrong merging). Attribution is 100% acoustic; subtitle metadata only votes to NAME the clusters. Without an API key (or the MCP fallback), speakers degrade to all-null and the pipeline keeps running.
+2. **Subtitle Gate** — external file → embedded soft stream → OCR tier. When only the OCR tier can serve the source, the extractor prints the Tier 3 instruction and exits 6 (awaiting the OCR pass), which is a route, not a refusal; footage with no dialogue at all is refused only after the user confirms it (`workspace.py check-subtitles --mode none`, exit 5). The pipeline never invents dialogue.
+3. **Dual-Track Extraction** — FFmpeg shot cuts + keyframes run concurrently with subtitle ingestion and **acoustic speaker diarization** (ffmpeg extracts 16 kHz mono audio → a direct DashScope client streams the same Qwen3.8-Omni diarization request — code-owned retries/backoff, per-part resume, no client tool-window limits; MCP `omni_multi_speaker_asr` remains as a fallback → deterministic binding by aggregate per-cluster overlap, so a co-speaker covering ≥40% of a line survives as `secondary_speaker`). Multi-part runs snap cut points to silence, overlap adjacent parts by ±3 s, and reconcile cross-part identities only on co-occurrence evidence (the same utterance diarized in both parts — union-find, prefer splitting over wrong merging). A part the model reports as speech-free counts as finished: reruns skip it instead of paying for it again. Attribution is 100% acoustic; subtitle metadata only votes to NAME the clusters. Without an API key (or the MCP fallback), speakers degrade to all-null and the pipeline keeps running — and the degraded `speakers.json` says so (`acoustic_clustering_enabled: false`, `backend: "none"`).
 4. **LGSS-Inspired Scene Grouping** — a 1D DP solver folds 200+ physical cuts into macro scenes. Dialogue-crossed boundaries carry a large soft penalty (never a hard ban — the solver cannot deadlock into a single-scene collapse, and any forced cut is reported). With numpy/opencv installed, an HSV keyframe-palette distance (a lightweight "place" proxy in the spirit of LGSS, CVPR 2020) sharpens boundaries; without them it degrades to silence/duration heuristics.
-5. **Millisecond Alignment** — every dialogue cue is assigned to exactly one shot (max temporal overlap), with `ON_SCREEN` / `OFF_SCREEN` / `VOICE_OVER` / `INTERNAL_MONOLOGUE` flags.
-6. **Narrative Outline (optional, McKee sequence layer)** — `narrative_outline.py` emits a dialogue-stream work-order; the agent authors the sequence skeleton by value shift (title + value from→to + sub range), and the grouper switches to hierarchical mode: sequence walls snap to the nearest physical cut, then each sequence is solved independently. Without an outline the flat solve is unchanged.
+5. **Millisecond Alignment** — every dialogue cue is assigned to exactly one shot (max temporal overlap; a cue that clears no shot's overlap bar is bound to the temporally nearest one and reported, so the aligner can never hand the splicer a subtitle nobody was asked to place), with `ON_SCREEN` / `OFF_SCREEN` / `VOICE_OVER` / `INTERNAL_MONOLOGUE` flags.
+6. **Narrative Outline (optional, McKee sequence layer)** — `narrative_outline.py` emits a dialogue-stream work-order; the agent authors the sequence skeleton by value shift (title + value from→to + sub range), and the grouper switches to hierarchical mode: sequence walls snap to the nearest physical cut **within a 15 s window** (a wall with no cut that close is placed at the nearest preceding cut and reported with `within_snap_window: false`), then each sequence is solved independently. Without an outline the flat solve is unchanged.
 7. **Scene Understanding & Writing (chunked, resumable)** — `build_scene_manifest.py` emits a per-scene **evidence pack** (640px keyframe thumbnails, verbatim dialogue with timecodes, bible character names, previous-episode exemplars, the owning sequence's value arc) embedding the full writing contract; the multimodal agent reads keyframes per scene and authors real 场号制 screenplay text as `scene_drafts/scene_XX.md` — `△` action paragraphs woven between dialogue, with every line represented by a `[[SUB:n]]` placeholder (dialogue is never retyped).
 8. **Verbatim Splice & Assembly** — `splice_screenplay.py` replaces each `[[SUB:n]]` with the verbatim subtitle text — fidelity is guaranteed **by construction**; paraphrase is structurally impossible. Missing/duplicated/misplaced placeholders are fatal errors naming the offending indices. The assembled document carries a metadata header, 场次总表 (with the sequence column), spliced scenes, and an appendix of audio-visual statistics + fidelity report, written to `output/<Title>_影视文学剧本.md`.
 
@@ -47,6 +47,9 @@ python3 scripts/workspace.py init  --workspace "<ws>"
 python3 scripts/workspace.py probe --workspace "<ws>"
 python3 scripts/scene_detect.py --workspace "<ws>" --threshold 0.35 > "<ws>/.cache/visual/shots.json"
 python3 scripts/subtitle_extractor.py --workspace "<ws>" --require-subtitles > "<ws>/.cache/subtitles/extracted.json"
+#   ↑ exit 6 with a Tier 3 payload on stdout = the source is hard-subsidised; run the OCR pass
+#     and write extracted.json yourself. exit 5 (pure-visual refusal) belongs to
+#     `workspace.py check-subtitles --mode none`, after the user confirms there is no dialogue.
 python3 scripts/speaker_diarize.py --workspace "<ws>" prepare > "<ws>/.cache/audio/diarize_workorder.json"  # exit 6
 python3 scripts/speaker_diarize.py --workspace "<ws>" run
 #   ↑ path A (recommended): dials DashScope directly (DASHSCOPE_API_KEY in the env;
@@ -66,8 +69,15 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "<Title>"
 ## Development
 
 ```bash
-python3 -m pytest tests/ -q
+python3 -m pytest tests/ -q                 # unit + end-to-end (needs ffmpeg)
+python3 -m ruff check scripts tests --select F
 ```
+
+`.github/workflows/ci.yml` runs the suite twice per OS — once with the optional
+numpy/opencv pair, once without it — because the grouper's stdlib degradation path is
+part of the contract. `tests/test_end_to_end.py` synthesises a short episode with
+ffmpeg and drives all five stages, so stage-to-stage contract breaks (a subtitle the
+aligner dropped but the splicer demanded, say) cannot ship unnoticed.
 
 See [SKILL.md](skills/video-to-screenplay/SKILL.md) for the full agent workflow, the scene-writing contract, and the failure-mode matrix.
 

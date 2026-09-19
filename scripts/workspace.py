@@ -152,7 +152,7 @@ def probe_materials(workspace_root: str) -> Dict[str, Any]:
     return probe_result
 
 
-def run_doctor_check(workspace: Path | str | None = None) -> None:
+def run_doctor_check() -> None:
     """Inspect and report readiness of runtime tools, python audio-visual packages,
     and the acoustic-diarization API key (presence only - the key value NEVER
     enters the report, logs or any file)."""
@@ -200,11 +200,12 @@ def run_doctor_check(workspace: Path | str | None = None) -> None:
 
 def enforce_subtitles_guard(mode: str | None = None, workspace: Path | None = None) -> None:
     """
-    Fail fast if user or detector indicates pure visual video with no subtitles,
-    or if subtitles are missing from the workspace.
-    Dialogue is an absolute hard dependency for screenplay generation.
+    Fail fast if the user or the detector indicates a dialogue-free source, or if
+    subtitles are missing from the workspace. Dialogue is an absolute hard dependency.
+    `mode` only ever arrives as external|embedded|ocr|none (argparse restricts it),
+    so "none" is the sole refusal value - no invented aliases.
     """
-    if mode in ("none", "no_subtitles", "pure_visual") or (mode is None and workspace is None):
+    if mode == "none" or (mode is None and workspace is None):
         sys.stderr.write(
             "\n[FATAL BLOCKER] Screenplay generation strictly requires dialogue subtitles!\n"
             "Screenplay reverse-engineering cannot proceed on pure visual video without dialogue.\n"
@@ -260,7 +261,7 @@ def main():
     args = parser.parse_args()
 
     if args.command == "doctor":
-        run_doctor_check(args.workspace)
+        run_doctor_check()
     elif args.command == "init":
         dirs = init_workspace(args.workspace)
         sys.stdout.write(json.dumps({"status": "initialized", "directories": dirs}, indent=2) + "\n")

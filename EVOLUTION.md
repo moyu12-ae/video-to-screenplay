@@ -178,3 +178,75 @@
   and all skipped tracks are recorded in `extracted.json → embedded_stream` for audit.
 - **Scope note**: hardening the naming vote itself (ignoring SIGN-like metadata labels inside
   `name_clusters`) remains a possible v0.5 item; the selection guard removes the main entry path.
+
+## 11. v0.4.3 — Cross-Stage Contract Audit (fidelity and self-reporting honesty)
+
+- **Trigger (full-repo review)**: the stage-level design is sound, but the guarantees the
+  README/SKILL advertise and the guarantees the code actually enforces diverged in six
+  places — and every divergence sat on the dialogue-fidelity path the plugin exists for.
+  A synthetic 24 s episode (BOM + CRLF `.srt`, one cue past the final cut) reproduced the
+  chain end to end on `main`: 15 lines in → 14 parsed → aligner exits 0 → **splice exits 1**
+  with `1 subtitle(s) were never woven into any scene: [14]`, blaming the writing pass.
+- **Silent dialogue loss (P0)**: `parse_srt_file`/`parse_ass_file` opened with `utf-8`, so a
+  leading BOM glued itself to cue 1's index line, the block failed the timecode test, and the
+  first line of dialogue vanished with no error anywhere. Now `utf-8-sig`; SRT output is also
+  sorted/re-indexed chronologically to match the ASS parser, since `index` is the ordering
+  contract the `[[SUB:n]]` placeholders rely on.
+- **The OCR tier was unreachable (P1)**: with `--require-subtitles`, a hard-subsidised source
+  exited 5 *before* stdout was written, destroying the `NEEDS_OCR` payload and the instruction
+  it carries — the gate advertised three tiers and silently refused at the third. The payload
+  is now always written, and Tier 3 exits 6 (awaiting perception), matching the diarization
+  work-order convention. Exit 5 stays reserved for a user-confirmed no-dialogue source
+  (`check-subtitles --mode none`).
+- **Completeness contracts contradicted (P1)**: the aligner dropped cues with ≤100 ms overlap
+  (WARN only) while the splicer treats an unclaimed subtitle as fatal — and the writing pass
+  never saw the dropped cue, so the episode could not be assembled at all.
+  `assign_subtitles_to_shots()` now guarantees every cue lands on exactly one shot (max
+  overlap, else temporally nearest, reported as `cues_nearest_shot_fallback`), and refuses to
+  run at all when dialogue exists without shots.
+- **Degraded artifacts described themselves as measured (P1)**: `merge --empty-fallback` emitted
+  `acoustic_clustering_enabled: true` plus `backend: mcp_tool` and a model name for a run that
+  made zero calls. Degraded output now declares `false` / `none`, and
+  `distinct_speakers_detected` counts speakers actually attributed (with `clusters_formed`
+  reported separately) instead of the naming manifest.
+- **A silent part was a permanent failure (P1)**: `{"segments": []}` counted as invalid, so
+  `run` re-dialled a music-only part on every invocation (paying again) and `merge` exited 7 —
+  a chunked episode containing one speech-free stretch could never finish. New pure
+  `classify_omni_output()` distinguishes `ok` / `silent` / `invalid`; `silent` counts as done
+  for resume and warns once in merge, while present-but-unparseable segments still fail.
+- **Truncated replies parsed as valid (P1)**: `extract_json_payload` sliced to the LAST closing
+  brace, so a stream cut mid-array became valid-looking shorter JSON and the lost tail of
+  speakers was never attributed. It now `raw_decode`s a complete value; `finish_reason: length`
+  fails fast with a re-chunking hint instead of retrying, and an unparseable completion is
+  classified transient so the retry loop sees it (previously a bare `ValueError` killed the part).
+- **Overwritten secondary voice (P2)**: best/second were tracked per *turn*, so two short turns
+  of one cluster together out-covering one long turn of another lost the second speaker
+  silently. Overlap is now accumulated per cluster before ranking.
+- **Advertised-but-unimplemented snap window (P2)**: `SEQ_WALL_SNAP_MS` was defined and never
+  read; sequence walls teleported to the nearest cut however far. Walls now honour the 15 s
+  window, land on the nearest *preceding* cut beyond it, and report `within_snap_window`.
+  Degenerate outlines (single shot vs multiple sequences, zero-width partitions) fall back to
+  flat solving with a warning rather than emitting `start > end` ranges.
+- **Silent emptiness (P2)**: an empty scene solve exited 0 (→ blank screenplay); the visual
+  affinity flag reported dependencies present rather than boundaries measured; an ignored
+  `--target-scenes`/`--min-scenes` in hierarchical mode vanished without a word. All three are
+  now loud, and a zero-scene solve is fatal.
+- **Hygiene (P2)**: workspace part writes go through `write_json_atomic()` (temp + `os.replace`),
+  Tier 2 uses `mkstemp` with guaranteed cleanup instead of a predictable shared `/tmp` name,
+  failed MP3 fit tiers are unlinked, `V2S_OMNI_ATTEMPTS=0` surfaces its real error instead of
+  "retry loop exhausted", container/subtitle extension sets are aligned across stages, and the
+  dead imports an `ruff -F` pass turned up are gone.
+- **Distribution**: added the missing `.claude-plugin/plugin.json` (the marketplace advertised
+  `"source": "./"` with no manifest behind it), `.github/workflows/ci.yml` (suite × {with,
+  without} numpy/opencv on Linux + macOS, plus the `ruff -F` gate), and `tests/test_packaging.py`
+  so manifest/marketplace drift fails a test instead of an install.
+- **Tests**: 115 → 159. New `tests/test_pipeline_hardening.py` (per-fix regressions),
+  `tests/test_end_to_end.py` (synthesises the episode above with ffmpeg and asserts all 15
+  lines land verbatim, no provisional label leaks, no placeholder survives), and
+  `tests/test_packaging.py`; the vacuous wall-snap assertion is now an equality pin, and
+  `test_dp_chosen_cut_set_is_pinned` freezes the DP's selected cut set so cost-function drift
+  can no longer pass 159/159.
+- **Deliberately out of scope**: the solver's tuned constants (`min_scenes` as a hard floor, the
+  decorative K loop, the `(10 - sec) * 3` segment cost that discards fine-grained evidence under
+  ~6 s), and splitting `speaker_diarize.py` into modules — behaviour changes and a refactor, not
+  bug fixes. Recorded as v0.5 candidates.

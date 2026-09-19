@@ -25,7 +25,6 @@ modalities by dialogue turn continuity and silence gaps.
 
 import argparse
 import json
-import math
 import os
 import sys
 from typing import List, Dict, Any, Set, Tuple, Optional
@@ -51,6 +50,9 @@ def format_timecode(ms: int) -> str:
 
 
 class SemanticSceneGrouper:
+    # Default floor for macro scene count; also the argparse default. The hierarchy
+    # warns when a caller moves it, because that mode derives its count from the outline.
+    DEFAULT_MIN_SCENES = 8
     # Large finite cost replacing the former hard INF ban on dialogue-protected
     # boundaries. Must exceed the maximum affinity reward (8.0) plus typical
     # segment-cost differentials so protected cuts remain strictly discouraged.
@@ -65,7 +67,7 @@ class SemanticSceneGrouper:
         shots_data: List[Dict[str, Any]],
         subtitles_data: List[Dict[str, Any]],
         bible_data: Optional[Dict[str, Any]] = None,
-        min_scenes: int = 8,
+        min_scenes: int = DEFAULT_MIN_SCENES,
         max_scenes: int = 35,
         target_scenes: Optional[int] = None,
         keyframes_dir: Optional[str] = None,
@@ -83,6 +85,9 @@ class SemanticSceneGrouper:
         # Shot-level keyframe extraction failures (from shots.json) propagated so
         # downstream stages keep the "visually unverified" honesty flag alive.
         self.failed_keyframes = list(failed_keyframes or [])
+        # Set by compute_visual_dissimilarities when the CV path actually runs.
+        self.visual_boundaries_covered = 0
+        self.visual_boundaries_total = 0
 
     def compute_dialogue_hard_constraints(self) -> Set[int]:
         """
@@ -166,12 +171,21 @@ class SemanticSceneGrouper:
             hists.append(hist)
 
         dissim: List[float] = [0.0] * max(0, len(self.shots) - 1)
+        measured = 0
         for i in range(len(self.shots) - 1):
             a, b = hists[i], hists[i + 1]
             if a is None or b is None:
                 continue  # missing keyframe -> neutral, never fabricate affinity
+            measured += 1  # a truly identical palette scores 0.0 and still counts
             intersection = float(np.sum(np.minimum(a, b)))  # in [0, 1]
             dissim[i] = max(0.0, min(1.0, 1.0 - intersection))
+        self.visual_boundaries_covered = measured
+        self.visual_boundaries_total = len(dissim)
+        if dissim and not measured:
+            sys.stderr.write(
+                "[WARN] Visual place affinity is armed but read zero usable keyframes "
+                f"({len(dissim)} boundaries, none measurable) - the solve runs on "
+                "dialogue/silence heuristics alone. Check --keyframes-dir.\n")
         return dissim
 
     def compute_boundary_affinity_scores(self, visual_dissim: Optional[List[float]] = None) -> List[float]:
@@ -262,28 +276,62 @@ class SemanticSceneGrouper:
             walls.append((float(prev.get("end_ms", 0)) + float(nxt.get("start_ms", 0))) / 2.0)
 
         cut_times = [float(self.shots[i].get("end_ms", 0) or 0.0) for i in range(n - 1)]
+        if len(seqs) > 1 and not cut_times:
+            sys.stderr.write(
+                f"[WARN] narrative outline: {len(seqs)} sequences but a single physical shot - "
+                "there is no cut for any sequence wall to land on; solving flat.\n")
+            return None
         snapped: List[int] = []
         snap_report: List[Dict[str, Any]] = []
         last = -1
+        beyond_window = 0
         for w in walls:
             if not cut_times:
                 break
             best_i = min(range(len(cut_times)), key=lambda i: abs(cut_times[i] - w))
             dist = abs(cut_times[best_i] - w)
+            within_window = dist <= self.SEQ_WALL_SNAP_MS
+            if not within_window:
+                # The nearest edit is outside the advertised snap window, so this
+                # turning point has no cut that genuinely matches it. Take the last
+                # cut at or before the wall - which keeps the sequences time-ordered
+                # and non-overlapping - and report it, rather than silently moving
+                # the wall up to minutes away and claiming a snap happened.
+                at_or_before = [i for i, ct in enumerate(cut_times) if ct <= w]
+                best_i = at_or_before[-1] if at_or_before else 0
+                dist = abs(cut_times[best_i] - w)
+                beyond_window += 1
             if best_i <= last:
                 best_i = last + 1
                 if best_i > n - 2:
                     sys.stderr.write("[WARN] narrative outline: walls collapse onto the final boundary - flat solving.\n")
                     return None
                 dist = abs(cut_times[best_i] - w)
+                within_window = within_window and dist <= self.SEQ_WALL_SNAP_MS
             snapped.append(best_i)
-            snap_report.append({"wall_ms": int(w), "snapped_boundary": best_i, "snap_distance_ms": int(dist)})
+            snap_report.append({"wall_ms": int(w), "snapped_boundary": best_i,
+                                "snap_distance_ms": int(dist),
+                                "within_snap_window": within_window})
             last = best_i
+        if beyond_window:
+            sys.stderr.write(
+                f"[WARN] {beyond_window}/{len(walls)} sequence wall(s) had no physical cut within "
+                f"{self.SEQ_WALL_SNAP_MS / 1000:.0f}s of the declared turning point; they were placed at "
+                "the nearest preceding cut and reported with within_snap_window=false "
+                "(check the outline's sub ranges against the video).\n")
 
         parts: List[Dict[str, Any]] = []
         prev = 0
         for k, seq in enumerate(seqs):
             end = snapped[k] if k < len(snapped) else n - 1
+            if end < prev:
+                # A wall sequence that ended up empty (two walls fighting for the
+                # same cut) must not become a start>end partition - downstream indexing
+                # on shots[end] is out of range for it.
+                sys.stderr.write(
+                    f"[WARN] narrative outline: sequence {k + 1} ('{str(seq.get('title', '')).strip()}') "
+                    "collapsed to zero shots and is merged into its neighbour.\n")
+                continue
             parts.append({
                 "start": prev,
                 "end": end,
@@ -292,6 +340,9 @@ class SemanticSceneGrouper:
                 "sequence_value": f"{seq.get('value_from', '')} -> {seq.get('value_to', '')}",
             })
             prev = end + 1
+        if not parts:
+            sys.stderr.write("[WARN] narrative outline: no usable sequence partition - solving flat.\n")
+            return None
         self.seq_snap_report = snap_report
         return parts
 
@@ -515,6 +566,11 @@ class SemanticSceneGrouper:
         sequence_labels: Optional[List[Dict[str, Any]]] = None
         seq_summary: List[Dict[str, Any]] = []
         if seq_parts is not None:
+            if self.target_scenes or self.min_scenes != self.DEFAULT_MIN_SCENES:
+                sys.stderr.write(
+                    "[WARN] narrative hierarchy ignores --target-scenes/--min-scenes: each sequence is "
+                    "solved on its own granularity and the global --max-scenes budget is split by "
+                    "duration. Scene count comes from the outline, not those flags.\n")
             # Hierarchical mode: sequences are narrative walls; the scene DP solves
             # each sequence independently (its own granularity), and every scene
             # inherits its sequence's title + value arc. The global max_scenes
@@ -565,7 +621,12 @@ class SemanticSceneGrouper:
             "dialogue_protected_boundaries": len(prohibited),
             "forced_dialogue_cuts": forced_cuts,
             "failed_keyframes": self.failed_keyframes,
-            "visual_affinity_enabled": visual_dissim is not None,
+            # Honest capability flag: armed-but-blind (deps present, every keyframe
+            # missing) must not report as visual affinity being in play.
+            "visual_affinity_enabled": bool(visual_dissim is not None
+                                            and self.visual_boundaries_covered),
+            "visual_boundary_coverage": [self.visual_boundaries_covered,
+                                         self.visual_boundaries_total],
             "narrative_outline": {
                 "enabled": seq_parts is not None,
                 "sequences": seq_summary,
@@ -583,7 +644,7 @@ def main():
     parser.add_argument("--subtitles", "-u", default=None, help="Path to extracted_subtitles.json")
     parser.add_argument("--bible", "-b", default=None, help="Optional path to materials/bible.json")
     parser.add_argument("--workspace", "-w", default=None, help="Workspace root directory")
-    parser.add_argument("--min-scenes", type=int, default=8, help="Minimum number of macro scenes (default: 8)")
+    parser.add_argument("--min-scenes", type=int, default=SemanticSceneGrouper.DEFAULT_MIN_SCENES, help="Minimum number of macro scenes (default: 8)")
     parser.add_argument("--max-scenes", type=int, default=35, help="Maximum number of macro scenes (default: 35)")
     parser.add_argument("--target-scenes", type=int, default=None, help="Explicit target scene count")
     parser.add_argument("--keyframes-dir", default=None,
@@ -671,6 +732,16 @@ def main():
     )
 
     result = grouper.run()
+    if not result["scenes"]:
+        # Previously an empty solve still exited 0, so the next stage inherited a
+        # scene list of zero length and the screenplay came out blank with no signal.
+        sys.stderr.write(
+            f"[FATAL] Solver produced 0 macro scenes from {len(shots_list)} shot(s) and "
+            f"{len(subs_list)} dialogue cue(s). Empty scenes.json would silently produce an "
+            "empty screenplay - check the shots.json timecodes and, in hierarchical mode, "
+            "the outline's sub ranges.\n")
+        sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        sys.exit(1)
     sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 
 

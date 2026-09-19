@@ -376,13 +376,23 @@ class TestOmniClient(unittest.TestCase):
                  'data: {"choices":[],"usage":{"total_tokens":7}}',
                  'data: [DONE]',
                  'data: {"choices":[{"delta":{"content":" ignored"}}]}']
-        text, usage = omni_client.accumulate_sse(lines)
+        text, usage, finish = omni_client.accumulate_sse(lines)
         self.assertEqual(text, "Hello world")
         self.assertEqual(usage, {"total_tokens": 7})
+        self.assertIsNone(finish)
+
+    def test_accumulate_sse_reports_finish_reason(self):
+        text, _, finish = omni_client.accumulate_sse([
+            'data: {"choices":[{"delta":{"content":"{\\"segments\\":[]"},"finish_reason":"length"}]}',
+            'data: [DONE]'])
+        self.assertEqual(finish, "length")
+        self.assertTrue(text)
 
     def test_accumulate_sse_accepts_bytes_lines(self):
-        text, _ = omni_client.accumulate_sse([b'data: {"choices":[{"delta":{"content":"ok"}}]}'])
+        text, _, finish = omni_client.accumulate_sse(
+            [b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}'])
         self.assertEqual(text, "ok")
+        self.assertEqual(finish, "stop")
 
     def test_extract_json_payload_variants(self):
         self.assertEqual(omni_client.extract_json_payload('```json\n{"a": 1}\n```'), {"a": 1})

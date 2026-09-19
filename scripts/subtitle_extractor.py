@@ -18,7 +18,6 @@ import argparse
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 
@@ -125,7 +124,10 @@ def parse_srt_file(file_path: str) -> List[Dict[str, Any]]:
     if not os.path.isfile(file_path):
         return entries
 
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+    # utf-8-sig, not utf-8: a leading BOM glues itself to the first cue's index
+    # line, that block then fails the timecode check, and the first line of
+    # dialogue vanishes with no error at all. Notepad and most fansub tools emit it.
+    with open(file_path, 'r', encoding='utf-8-sig', errors='replace') as f:
         content = f.read()
 
     blocks = re.split(r'\n\s*\n', content.strip())
@@ -153,6 +155,12 @@ def parse_srt_file(file_path: str) -> List[Dict[str, Any]]:
                             "text": final_text,
                             "speaker": spk
                         })
+    # Same time-order contract the ASS parser already honours: downstream stages
+    # treat `index` as chronological, so an out-of-order source file must not
+    # produce [[SUB:n]] placeholders that run backwards in time.
+    entries.sort(key=lambda x: x["start_ms"])
+    for i, e in enumerate(entries):
+        e["index"] = i + 1
     return entries
 
 
@@ -165,7 +173,7 @@ def parse_ass_file(file_path: str) -> List[Dict[str, Any]]:
     in_events = False
     format_indices = {}
 
-    with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+    with open(file_path, 'r', encoding='utf-8-sig', errors='replace') as f:
         for line in f:
             line = line.strip()
             if line.startswith('[Events]'):
@@ -360,23 +368,35 @@ class SubtitleExtractor:
             }
 
             out_ext = ".ass" if "ass" in codec_name else ".srt"
-            temp_sub = os.path.join(tempfile.gettempdir(), f"extracted_stream_{stream_idx}{out_ext}")
-
-            extract_res = subprocess.run(
-                ["ffmpeg", "-y", "-i", self.video_path, "-map", f"0:{stream_idx}", temp_sub],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=25,
-                shell=False
-            )
-            if extract_res.returncode == 0 and os.path.isfile(temp_sub):
-                if out_ext == ".ass":
-                    entries = parse_ass_file(temp_sub)
-                else:
-                    entries = parse_srt_file(temp_sub)
-                if entries:
-                    info = f"TIER_2_EMBEDDED: Stream #{stream_idx} ({codec_name}, lang={track_lang}, title='{track_title}', reason={reason})"
-                    return (info, entries, selection_meta)
+            # mkstemp, not a name derived from the stream index: concurrent
+            # workspaces (and other users on a shared /tmp) would otherwise write
+            # through the same path and read back each other's subtitles.
+            fd, temp_sub = tempfile.mkstemp(prefix=f"v2s_stream_{stream_idx}_", suffix=out_ext)
+            os.close(fd)
+            try:
+                extract_res = subprocess.run(
+                    ["ffmpeg", "-y", "-i", self.video_path, "-map", f"0:{stream_idx}", temp_sub],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=25,
+                    shell=False
+                )
+                if extract_res.returncode == 0 and os.path.isfile(temp_sub):
+                    if out_ext == ".ass":
+                        entries = parse_ass_file(temp_sub)
+                    else:
+                        entries = parse_srt_file(temp_sub)
+                    if entries:
+                        info = f"TIER_2_EMBEDDED: Stream #{stream_idx} ({codec_name}, lang={track_lang}, title='{track_title}', reason={reason})"
+                        return (info, entries, selection_meta)
+            except Exception as e:
+                sys.stderr.write(f"[WARN] Tier 2 extraction failed: {e}\n")
+            finally:
+                if os.path.isfile(temp_sub):
+                    try:
+                        os.unlink(temp_sub)
+                    except OSError:
+                        pass
 
         except Exception as e:
             sys.stderr.write(f"[WARN] Tier 2 extraction failed: {e}\n")
@@ -417,6 +437,7 @@ class SubtitleExtractor:
             "source_tier": "TIER_3_HARDCODED_OCR",
             "source_detail": "Wangyan OCR MCP required (http://127.0.0.1:8901)",
             "video_path": self.video_path,
+            "subtitle_count": 0,
             "status": "NEEDS_OCR",
             "instruction": "Invoke mcp__wangyan-ocr__wangyan_ocr_api POST /import -> POST /predet -> POST /pipeline -> POST /export."
         }
@@ -440,7 +461,12 @@ def main():
         mat_dir = os.path.join(ws, "materials")
         if os.path.isdir(mat_dir):
             candidates = sorted(
-                f for f in os.listdir(mat_dir) if f.lower().endswith((".mp4", ".mkv", ".mov", ".avi"))
+                f for f in os.listdir(mat_dir)
+                # Same accepted-container set as scene_detect.py / workspace.py — a
+                # .webm or .ts source used to be discovered for subtitles but never
+                # the other way round, so the two tracks disagreed on which video
+                # the job was even about.
+                if f.lower().endswith((".mp4", ".mkv", ".mov", ".webm", ".avi", ".ts"))
             )
             if len(candidates) > 1:
                 sys.stderr.write(
@@ -461,23 +487,29 @@ def main():
         mat_dir = os.path.join(ws, "materials")
         if os.path.isdir(mat_dir):
             for f in sorted(os.listdir(mat_dir)):
-                if f.lower().endswith((".srt", ".ass", ".vtt")):
+                if f.lower().endswith((".srt", ".ass", ".ssa", ".vtt")):
                     external_sub = os.path.join(mat_dir, f)
                     break
 
     extractor = SubtitleExtractor(video_input, external_sub, args.lang)
     res = extractor.extract()
 
-    # If --require-subtitles is passed and subtitle_count == 0, fail fast!
+    # Output pure JSON to stdout (standard UNIX filter pattern). This happens BEFORE
+    # any exit code: the payload is the only channel that carries the Tier 3 OCR
+    # instruction, and exiting 5 here used to swallow it — which made a hard-subsidised
+    # source look identical to a dialogue-free one and closed off the tier the gate
+    # itself advertises. Refusal on truly pure-visual footage belongs to
+    # `workspace.py check-subtitles --mode none` (exit 5), after the user confirms it.
+    sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
+
     if args.require_subtitles and res.get("subtitle_count", 0) == 0:
         sys.stderr.write(
-            "[FATAL] Pure visual video without subtitles is rejected. Screenplay generation requires dialogue.\n"
-            "Please provide an external subtitle (.srt/.ass) in materials/ or use a video with embedded subtitles.\n"
+            "[AWAITING] No external file and no embedded subtitle stream — only the OCR tier can serve this source.\n"
+            "Run the hard-subtitle OCR pass and write .cache/subtitles/extracted.json per the Tier 3 instruction above,\n"
+            "or, if the footage is genuinely dialogue-free, refuse the job with\n"
+            "  `python3 scripts/workspace.py check-subtitles --mode none` (exit 5).\n"
         )
-        sys.exit(5)
-
-    # Output pure JSON to stdout (standard UNIX filter pattern)
-    sys.stdout.write(json.dumps(res, ensure_ascii=False, indent=2) + "\n")
+        sys.exit(6)
 
 
 if __name__ == "__main__":

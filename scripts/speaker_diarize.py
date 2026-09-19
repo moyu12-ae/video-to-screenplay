@@ -103,6 +103,24 @@ def is_provisional_label(speaker: Any) -> bool:
     return (not s) or s in {"UNKNOWN", "SPEAKER_UNKNOWN"} or bool(SPEAKER_LABEL_RE.match(s))
 
 
+def write_json_atomic(path: Path, payload: Any) -> None:
+    """Write JSON through a sibling temp file then os.replace it into place.
+
+    A part killed mid-write used to leave a truncated omni_diarized.partNNN.json
+    behind, and the next `run` could resume over it instead of re-doing that part."""
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------
 # prepare phase
 # ---------------------------------------------------------------------------
@@ -292,7 +310,7 @@ def locate_video(ws: Optional[str], override: Optional[str]) -> Optional[str]:
         mat = os.path.join(ws, "materials")
         if os.path.isdir(mat):
             for f in sorted(os.listdir(mat)):
-                if f.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm")):
+                if f.lower().endswith((".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts")):
                     return os.path.join(mat, f)
     return None
 
@@ -461,7 +479,9 @@ def cmd_run(ws: Optional[str], force: bool = False) -> None:
             data = json.loads(pth.read_text(encoding="utf-8"))
         except Exception:
             return False
-        return bool(normalize_omni_segments(data, 0))
+        # A silent part is a completed part: re-dialling it would pay again for the
+        # same answer on every `run`, and merge no longer rejects it either.
+        return classify_omni_output(data) in ("ok", "silent")
 
     # Long parts stream for roughly 0.5-1x their audio length; warn before any spend.
     for p in parts:
@@ -486,7 +506,14 @@ def cmd_run(ws: Optional[str], force: bool = False) -> None:
     for i, p in enumerate(parts):
         out_p = output_path(p)
         if not force and out_p.is_file() and is_valid_output(out_p):
-            sys.stderr.write(f"[SKIP] part{i:03d}: {out_p.name} already present and valid (--force to redo)\n")
+            try:
+                prior_state = classify_omni_output(json.loads(out_p.read_text(encoding="utf-8")))
+            except Exception:  # noqa: BLE001 - is_valid_output already parsed it
+                prior_state = "ok"
+            sys.stderr.write(
+                f"[SKIP] part{i:03d}: {out_p.name} already present and valid"
+                + (" (reported no speech)" if prior_state == "silent" else "")
+                + " (--force to redo)\n")
             continue
         in_p = part_audio_path(p)
         if not in_p.is_file():
@@ -507,8 +534,14 @@ def cmd_run(ws: Optional[str], force: bool = False) -> None:
             sys.stderr.write(f"[ERROR] part{i:03d}: {type(e).__name__}: {str(e)[:200]}\n")
             failed.append(f"part{i:03d} {type(e).__name__}")
             continue
-        out_p.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        sys.stderr.write(f"[OK  ] part{i:03d}: {len(result.get('segments') or [])} segments -> {out_p.name}\n")
+        write_json_atomic(out_p, result)
+        state = classify_omni_output(result)
+        sys.stderr.write(
+            f"[OK  ] part{i:03d}: {len(result.get('segments') or [])} segments -> {out_p.name}\n")
+        if state == "silent":
+            sys.stderr.write(
+                f"[WARN] part{i:03d}: Omni reported no speech for this part; it counts as done "
+                "(rerun with --force only if the audio really had dialogue)\n")
 
     missing = [os.path.basename(p["output"]) for p in parts if not output_path(p).is_file()]
     if missing or failed:
@@ -569,6 +602,33 @@ def normalize_omni_segments(data: Dict[str, Any], offset_ms: int) -> List[Dict[s
         })
     turns.sort(key=lambda t: (t["start_ms"], t["end_ms"], t["raw_label"]))
     return turns
+
+
+def classify_omni_output(data: Any) -> str:
+    """Sort a saved Omni block into 'ok' | 'silent' | 'invalid'.
+
+    'silent' means the model was given speech-free audio and said so - an explicit
+    empty segments list. That distinction matters: treating it as invalid made `run`
+    re-dial a music-only part on every invocation (paying again for the same answer)
+    and made `merge` exit 7, so a chunked episode containing one silent stretch could
+    never reach `merge` at all. Segments that are present but all unparseable stay
+    'invalid', because that is a bad response rather than a quiet one."""
+    if isinstance(data, dict):
+        if "segments" in data:
+            raw = data.get("segments")
+        elif "results" in data:
+            raw = data.get("results")
+        else:
+            return "invalid"
+    elif isinstance(data, list):
+        raw = data
+    else:
+        return "invalid"
+    if not isinstance(raw, list):
+        return "invalid"
+    if not raw:
+        return "silent"
+    return "ok" if normalize_omni_segments(data, 0) else "invalid"
 
 
 def build_cluster_map(turns: List[Dict[str, Any]]) -> Dict[Tuple[int, str], str]:
@@ -642,7 +702,7 @@ def estimate_subtitle_offset_ms(items: List[Dict[str, Any]],
     subs are often systematically shifted against the audio (typically leading by
     1-3 s). The acoustic turns are the accurate timeline, so estimate ONE global
     shift — applied to subtitle windows — that maximizes total best-overlap
-    against them: cross-correlation between the two timelines. Deterministic;
+    against them: a lag sweep over the two timelines. Deterministic;
     returns 0 unless enough lines exist for a meaningful consensus."""
     if not items or not turns or len(items) < MIN_SUBTITLE_LINES_FOR_OFFSET:
         return 0
@@ -653,8 +713,13 @@ def estimate_subtitle_offset_ms(items: List[Dict[str, Any]],
     for delta in range(-span, span + 1, step):
         total = 0.0
         for it in items:
-            s = int(it.get("start_ms", 0)) + delta
-            dur = max(1, int(it.get("end_ms", s)) - int(it.get("start_ms", 0)))
+            s0 = int(it.get("start_ms", 0))
+            # Read the length from the UNSHIFTED fields: defaulting end_ms to the
+            # already-shifted start made the window length a function of the trial
+            # delta, so a line without end_ms scored better the further it drifted.
+            e0 = int(it.get("end_ms", s0))
+            dur = max(1, e0 - s0)
+            s = s0 + delta
             best = 0.0
             for ts, te in turn_spans:
                 ov = _overlap_ms(s, s + dur, ts, te)
@@ -684,20 +749,25 @@ def bind_lines(items: List[Dict[str, Any]],
         # corrected windows: subtitle frame shifted onto the acoustic timeline
         c_start, c_end = start + offset_ms, end + offset_ms
 
-        best: Optional[Dict[str, Any]] = None
-        second: Optional[Dict[str, Any]] = None
+        # Overlap is accumulated PER CLUSTER, not per turn. Tracking the two biggest
+        # individual turns lost a genuine second voice: two short turns of cluster A
+        # together out-covering one long turn of cluster B still reported A alone, so
+        # overlap dialogue silently dropped its co-speaker.
+        per_cluster: Dict[str, Dict[str, Any]] = {}
         for t in turns:
             ov = _overlap_ms(c_start, c_end, t["start_ms"], t["end_ms"])
             if ov <= 0:
                 continue
-            cand = {"turn": t, "overlap": ov, "ratio": ov / dur}
-            if best is None or ov > best["overlap"]:
-                second = best
-                best = cand
-            elif second is None or ov > second["overlap"]:
-                second = cand
+            acc = per_cluster.get(t["cluster_id"])
+            if acc is None:
+                per_cluster[t["cluster_id"]] = {"overlap": ov, "turn": t, "turn_overlap": ov}
+            else:
+                acc["overlap"] += ov
+                if ov > acc["turn_overlap"]:
+                    acc["turn"] = t
+                    acc["turn_overlap"] = ov
 
-        if best is None:
+        if not per_cluster:
             rows.append({
                 "segment_id": i + 1, "start_ms": start, "end_ms": end,
                 "speaker": None, "confidence": 0.0,
@@ -706,16 +776,15 @@ def bind_lines(items: List[Dict[str, Any]],
             })
             continue
 
-        turn = best["turn"]
-        cluster_id = turn["cluster_id"]
-        ratio = best["ratio"]
+        ranked = sorted(per_cluster.items(), key=lambda kv: (-kv[1]["overlap"], kv[0]))
+        cluster_id, primary = ranked[0]
+        ratio = primary["overlap"] / dur
         confidence = CONF_HIGH if ratio >= CONF_HIGH_RATIO else (
             CONF_MID if ratio >= CONF_MID_RATIO else CONF_LOW)
 
         secondary = None
-        if second is not None and second["turn"]["cluster_id"] != cluster_id \
-                and second["ratio"] >= SECONDARY_MIN_RATIO:
-            secondary = second["turn"]["cluster_id"]
+        if len(ranked) > 1 and ranked[1][1]["overlap"] / dur >= SECONDARY_MIN_RATIO:
+            secondary = ranked[1][0]
 
         rows.append({
             "segment_id": i + 1, "start_ms": start, "end_ms": end,
@@ -723,7 +792,7 @@ def bind_lines(items: List[Dict[str, Any]],
             "confidence": confidence,
             "method": "acoustic_diarization", "cluster_id": cluster_id,
             "secondary_speaker": secondary,
-            "text_agreement": _text_agreement(text, turn["text"]),
+            "text_agreement": _text_agreement(text, primary["turn"]["text"]),
         })
         cluster_lines.setdefault(cluster_id, []).append(item)
 
@@ -760,7 +829,8 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
                  empty_reason: Optional[str] = None,
                  subtitle_alignment: Optional[Dict[str, Any]] = None,
                  backend: Optional[str] = None,
-                 part_metas: Optional[List[Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
+                 part_metas: Optional[List[Optional[Dict[str, Any]]]] = None,
+                 acoustic_enabled: bool = True) -> Dict[str, Any]:
     named_rows = []
     for r in rows:
         row = dict(r)
@@ -789,16 +859,24 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
     return {
         "video_path": video_name,
         "total_segments": len(named_rows),
-        "distinct_speakers_detected": len(manifest),
+        # Distinct attributed identities, not line count and not the naming manifest:
+        # len(manifest) reported 0 whenever acoustics ran but metadata could not name
+        # a single cluster, which read as "no speakers found".
+        "distinct_speakers_detected": len({r["speaker"] for r in named_rows if r["speaker"]}),
+        "clusters_formed": len(cluster_lines),
         "unattributed_segments": unattributed,
-        "acoustic_clustering_enabled": True,
+        # Downstream reads this to decide whether a blank speaker column means
+        # "acoustics found nobody" or "acoustics never ran" - it must not claim
+        # clustering happened on a degraded artifact.
+        "acoustic_clustering_enabled": acoustic_enabled,
         "attribution_method": ATTRIBUTION_METHOD,
         "degradation": empty_reason,
         "diarization_source": {
-            "tool": MCP_TOOL_NAME,
-            "model": ("; ".join(models) if models else "qwen3.8-omni-flash (MCP default)"),
+            "tool": MCP_TOOL_NAME if acoustic_enabled else "none",
+            "model": ("; ".join(models) if models
+                      else ("qwen3.8-omni-flash (MCP default)" if acoustic_enabled else "none")),
             "parts": parts_used,
-            "backend": backend or "mcp_tool",
+            "backend": backend or ("mcp_tool" if acoustic_enabled else "none"),
         },
         "subtitle_alignment": subtitle_alignment,
         "characters_manifest": manifest,
@@ -826,7 +904,8 @@ def _empty_output(video_name: str, items: List[Dict[str, Any]], reason: str) -> 
         "method": "unattributed_diarization_unavailable",
         "cluster_id": None, "secondary_speaker": None, "text_agreement": None,
     } for i, it in enumerate(items)]
-    return build_output(video_name, items, rows, {}, [], {}, {}, [], empty_reason=reason)
+    return build_output(video_name, items, rows, {}, [], {}, {}, [], empty_reason=reason,
+                        acoustic_enabled=False)
 
 
 def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]], List[Optional[Dict[str, Any]]]]:
@@ -882,11 +961,15 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]],
         except Exception as e:
             sys.stderr.write(f"[FATAL] Omni output {path} is not valid JSON: {e}\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
-        part_turns = normalize_omni_segments(data, offset)
-        if not part_turns:
+        state = classify_omni_output(data)
+        if state == "invalid":
             sys.stderr.write(f"[FATAL] Omni output {path} contains no usable segments "
                              f"(expected {{'segments': [{{speaker,start,end,text}}]}})\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+        if state == "silent":
+            sys.stderr.write(f"[WARN] Omni output {fname} reported no speech; its span stays "
+                             "unattributed instead of failing the merge\n")
+        part_turns = normalize_omni_segments(data, offset)
         for t in part_turns:
             t["part"] = idx
             t["part_file"] = fname
@@ -950,12 +1033,17 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
     if offset_ms:
         sys.stderr.write(f"[INFO] Global subtitle-vs-audio offset: {offset_ms:+d} ms "
                          "(subtitle windows shifted before binding)\n")
+    if abs(offset_ms) >= int(SUBTITLE_OFFSET_SEARCH_SEC * 1000):
+        sys.stderr.write(
+            f"[WARN] The best offset sits on the edge of the ±{SUBTITLE_OFFSET_SEARCH_SEC:.0f}s search "
+            "window, so the real drift may be larger and binding is only partly corrected. Check the "
+            "subtitle file's timebase against the video.\n")
     rows, cluster_lines = bind_lines(items, turns, offset_ms)
     alignment = {
         "offset_ms": offset_ms,
         "search_range_sec": SUBTITLE_OFFSET_SEARCH_SEC,
         "step_ms": SUBTITLE_OFFSET_STEP_MS,
-        "method": "global_cross_correlation",
+        "method": "global_max_overlap_grid_search",
     }
     names, manifest = name_clusters(cluster_lines)
     sys.stdout.write(json.dumps(

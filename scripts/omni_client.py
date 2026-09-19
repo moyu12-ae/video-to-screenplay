@@ -240,16 +240,24 @@ def fit_audio(audio_path: str, duration_sec: float,
         out = _encode_audio(src, "mp3", kbps)
         if out.stat().st_size <= budget:
             return out, "mp3"
+        # This tier overshot: drop it, else the last failed encode is orphaned beside
+        # the source when every tier busts the budget and we raise.
+        out.unlink(missing_ok=True)
     raise ValueError("audio payload exceeds the inline budget at every MP3 tier; "
                      "split it into shorter parts")
 
 
-def accumulate_sse(lines: Iterable[Union[bytes, str]]) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """Fold an SSE line stream into (text, usage). Tolerates comment / blank /
-    malformed lines (skipped), skips choice-less chunks (the trailing usage
-    chunk), accumulates every delta.content, and stops at 'data: [DONE]'."""
+def accumulate_sse(lines: Iterable[Union[bytes, str]]) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    """Fold an SSE line stream into (text, usage, finish_reason). Tolerates comment /
+    blank / malformed lines (skipped), skips choice-less chunks (the trailing usage
+    chunk), accumulates every delta.content, and stops at 'data: [DONE]'.
+
+    finish_reason is the last one seen ('stop' | 'length' | ...), or None when the
+    stream ended before the server reported one - 'length' is what distinguishes a
+    response cut off by max_tokens from one that merely looks short."""
     parts: List[str] = []
     usage: Optional[Dict[str, Any]] = None
+    finish: Optional[str] = None
     for raw in lines:
         line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
         line = line.strip()
@@ -267,16 +275,20 @@ def accumulate_sse(lines: Iterable[Union[bytes, str]]) -> Tuple[str, Optional[Di
         if isinstance(chunk.get("usage"), dict):
             usage = chunk["usage"]
         for choice in chunk.get("choices") or []:
-            delta = (choice or {}).get("delta") or {}
+            choice = choice or {}
+            delta = choice.get("delta") or {}
             piece = delta.get("content")
             if piece:
                 parts.append(str(piece))
-    return "".join(parts), usage
+            if choice.get("finish_reason"):
+                finish = str(choice["finish_reason"])
+    return "".join(parts), usage, finish
 
 
 def extract_json_payload(text: str) -> Any:
-    """Pull the JSON value out of a model reply: strip ``` fences, slice to the
-    outermost braces, retry once without trailing commas. Raises ValueError."""
+    """Pull the JSON value out of a model reply: strip ``` fences, parse the first
+    complete value from the first bracket, retry once without trailing commas.
+    Raises ValueError."""
     s = str(text or "").strip()
     if not s:
         raise ValueError("empty completion")
@@ -284,17 +296,21 @@ def extract_json_payload(text: str) -> Any:
     if fence:
         s = fence.group(1).strip()
     opens = [i for i in (s.find("{"), s.find("[")) if i >= 0]
-    closes = [i for i in (s.rfind("}"), s.rfind("]")) if i >= 0]
-    if not opens or not closes:
+    if not opens:
         raise ValueError("no JSON object/array found in completion")
-    s = s[min(opens):max(closes) + 1]
+    start = min(opens)
+    decoder = json.JSONDecoder()
     try:
-        return json.loads(s)
+        # raw_decode succeeds only on a COMPLETE value. Slicing to the last closing
+        # brace instead - the previous behaviour - turned a stream cut off mid-array
+        # into valid-looking shorter JSON, so a part that lost its last N speakers
+        # was accepted silently and the dialogue simply never got attributed.
+        return decoder.raw_decode(s, start)[0]
     except ValueError:
         pass
-    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", s[start:])
     try:
-        return json.loads(s)
+        return decoder.raw_decode(cleaned, 0)[0]
     except ValueError as e:
         raise ValueError(f"completion is not valid JSON: {e}")
 
@@ -330,15 +346,18 @@ def _post_stream(url: str, api_key: str, body: Dict[str, Any],
 
     text: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
+    finish: Optional[str] = None
     try:
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if "text/event-stream" in ctype:
-            text, usage = accumulate_sse(resp)
+            text, usage, finish = accumulate_sse(resp)
         else:
             data = json.loads(resp.read().decode("utf-8", "replace"))
             choices = data.get("choices") if isinstance(data, dict) else None
-            message = (choices[0] or {}).get("message") or {} if choices else {}
+            first = (choices[0] or {}) if choices else {}
+            message = first.get("message") or {}
             text = str(message.get("content") or "")
+            finish = first.get("finish_reason") or None
             usage = data.get("usage") if isinstance(data, dict) else None
     except (TimeoutError, socket.timeout):
         raise OmniError("timeout", detail=f"host {host}")
@@ -348,6 +367,12 @@ def _post_stream(url: str, api_key: str, body: Dict[str, Any],
         resp.close()
     if not (text or "").strip():
         raise OmniError("empty", detail=f"host {host}")
+    if finish == "length":
+        # max_tokens ran out mid-reply. Retrying would reproduce the same cut, and
+        # accepting it would drop the tail of the part's speakers unnoticed.
+        raise OmniError("bad_request",
+                        detail=f"completion truncated by max_tokens on host {host}; "
+                               "re-prepare with a shorter --chunk-seconds")
     return text, usage
 
 
@@ -376,8 +401,12 @@ def call_omni_chat(messages: List[Dict[str, Any]], *, api_key: Optional[str] = N
     }
     to = timeout_sec if timeout_sec is not None else _env_float("V2S_OMNI_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)
     n = attempts if attempts is not None else _env_int("V2S_OMNI_ATTEMPTS", DEFAULT_ATTEMPTS)
+    # Clamp before the loop: with V2S_OMNI_ATTEMPTS=0 the old `attempt == n - 1`
+    # terminal test never fired, so the last real error was swallowed and replaced
+    # by a misleading "retry loop exhausted".
+    n = max(1, n)
     last = ""
-    for attempt in range(max(1, n)):
+    for attempt in range(n):
         if attempt:
             delay = min(BACKOFF_CAP_SEC, BACKOFF_BASE_SEC * (2 ** (attempt - 1))) * _RNG.uniform(0.5, 1.0)
             _log(log, f"[RETRY] attempt {attempt + 1}/{n} in {delay:.1f}s (previous: {last})")
@@ -437,7 +466,13 @@ def diarize_audio_file(audio_path: str, *, api_key: Optional[str] = None,
         messages = [{"role": "user", "content": [audio_part, {"type": "text", "text": prompt}]}]
         text, usage = call_omni_chat(messages, api_key=api_key, base_url=base_url, model=model,
                                      timeout_sec=timeout_sec, attempts=attempts, log=log)
-        data = extract_json_payload(text)
+        try:
+            data = extract_json_payload(text)
+        except ValueError as e:
+            # A reply we cannot parse is a transient outcome, not a part failure:
+            # surfacing it as a bare ValueError used to bypass the retry loop and
+            # mark the whole part dead on a single bad completion.
+            raise OmniError("empty", detail=f"unparseable completion ({e})")
         if isinstance(data, dict):
             raw = data.get("segments") or data.get("results") or []
         elif isinstance(data, list):

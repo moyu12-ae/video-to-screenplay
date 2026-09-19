@@ -1,0 +1,19 @@
+{
+  "name": "video-to-screenplay",
+  "description": "Reverse-engineer videos and anime episodes into production-standard Chinese 场号制 screenplays: clean workspace isolation, a subtitle gate with three ingestion tiers, FFmpeg shot cuts plus keyframes, Qwen3.8-Omni acoustic speaker diarization, LGSS-style DP scene clustering with an optional McKee sequence layer, and verbatim [[SUB:n]] splicing. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for acoustic diarization.",
+  "version": "1.0.0",
+  "author": "moyu12-ae",
+  "homepage": "https://github.com/moyu12-ae/video-to-screenplay",
+  "repository": "https://github.com/moyu12-ae/video-to-screenplay",
+  "license": "MIT",
+  "keywords": [
+    "video",
+    "screenplay",
+    "reverse-engineering",
+    "ffmpeg",
+    "anime",
+    "subtitles",
+    "scene-detection"
+  ],
+  "skills": "skills"
+}

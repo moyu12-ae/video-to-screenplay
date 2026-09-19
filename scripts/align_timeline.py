@@ -13,7 +13,7 @@ import argparse
 import json
 import os
 import sys
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Tuple
 
 
 def interval_overlap_ms(start1: int, end1: int, start2: int, end2: int) -> int:
@@ -21,6 +21,11 @@ def interval_overlap_ms(start1: int, end1: int, start2: int, end2: int) -> int:
     overlap_start = max(start1, start2)
     overlap_end = min(end1, end2)
     return max(0, overlap_end - overlap_start)
+
+
+def interval_gap_ms(start1: int, end1: int, start2: int, end2: int) -> int:
+    """Milliseconds separating two time intervals; 0 when they touch or overlap."""
+    return max(0, start1 - end2, start2 - end1)
 
 
 def format_timecode_ms(ms: int) -> str:
@@ -71,6 +76,55 @@ def scene_visual_verified(scene: Dict[str, Any], failed_keyframes: List[Any]) ->
         return not failed.issuperset(child_ids)
     sc_id = scene.get("scene_id") or scene.get("shot_id")
     return sc_id is not None and sc_id not in failed
+
+
+MIN_OVERLAP_MS = 100
+
+
+def assign_subtitles_to_shots(
+    subtitles_data: List[Dict[str, Any]], scenes_data: List[Dict[str, Any]]
+) -> Tuple[Dict[int, int], Dict[int, int], List[int]]:
+    """Bind every dialogue cue to exactly ONE shot.
+
+    Primary rule is maximal temporal overlap (> MIN_OVERLAP_MS), so a cue straddling
+    a cut no longer duplicates into both neighbours. Cues that clear that bar nowhere
+    — a sub-second sliver inside a shot, or a line past the final cut when duration
+    probing failed — are bound to the temporally nearest shot rather than dropped:
+    splice treats an unclaimed subtitle as fatal, and the writing pass cannot place
+    a cue that never reached the manifest, so dropping one deadlocked the pipeline.
+
+    Returns (shot index per cue, overlap per cue, cues bound by nearest-shot fallback).
+    """
+    best_overlap: Dict[int, int] = {}
+    assignment: Dict[int, int] = {}
+    for pos, scene in enumerate(scenes_data):
+        sc_start = scene.get("start_ms", 0)
+        sc_end = scene.get("end_ms", 0)
+        for sub_idx, sub in enumerate(subtitles_data):
+            ov = interval_overlap_ms(sc_start, sc_end, sub.get("start_ms", 0), sub.get("end_ms", 0))
+            if ov > MIN_OVERLAP_MS and ov > best_overlap.get(sub_idx, 0):
+                best_overlap[sub_idx] = ov
+                assignment[sub_idx] = pos
+
+    fallback: List[int] = []
+    if scenes_data:
+        for sub_idx in range(len(subtitles_data)):
+            if sub_idx in assignment:
+                continue
+            sub = subtitles_data[sub_idx]
+            s_start = sub.get("start_ms", 0)
+            s_end = sub.get("end_ms", 0)
+            nearest_pos, nearest_gap = None, None
+            for pos, scene in enumerate(scenes_data):
+                gap = interval_gap_ms(s_start, s_end, scene.get("start_ms", 0), scene.get("end_ms", 0))
+                if nearest_gap is None or gap < nearest_gap:
+                    nearest_gap, nearest_pos = gap, pos
+            if nearest_pos is not None:
+                assignment[sub_idx] = nearest_pos
+                best_overlap.setdefault(sub_idx, 0)
+                fallback.append(sub_idx)
+
+    return assignment, best_overlap, fallback
 
 
 def main():
@@ -139,16 +193,15 @@ def main():
 
     # Assign each subtitle to exactly ONE shot: the one with maximal temporal overlap.
     # A cue straddling a cut (L-cut) previously duplicated into both adjacent shots.
-    sub_best_overlap: Dict[int, int] = {}
-    sub_shot_assignment: Dict[int, int] = {}
-    for pos, scene in enumerate(scenes_data):
-        sc_start = scene.get("start_ms", 0)
-        sc_end = scene.get("end_ms", 0)
-        for sub_idx, sub in enumerate(subtitles_data):
-            ov = interval_overlap_ms(sc_start, sc_end, sub.get("start_ms", 0), sub.get("end_ms", 0))
-            if ov > 100 and ov > sub_best_overlap.get(sub_idx, 0):
-                sub_best_overlap[sub_idx] = ov
-                sub_shot_assignment[sub_idx] = pos
+    if subtitles_data and not scenes_data:
+        sys.stderr.write(
+            f"[FATAL] {len(subtitles_data)} dialogue cue(s) but no shots in {scenes_path}. "
+            "Nothing can be aligned; run scene_detect.py and semantic_scene_grouper.py first.\n"
+        )
+        sys.exit(1)
+
+    sub_shot_assignment, sub_best_overlap, fallback_cues = assign_subtitles_to_shots(
+        subtitles_data, scenes_data)
 
     per_shot_sub_indices: Dict[int, List[int]] = {pos: [] for pos in range(len(scenes_data))}
     for sub_idx, pos in sub_shot_assignment.items():
@@ -157,8 +210,16 @@ def main():
     orphan_cues = len(subtitles_data) - len(sub_shot_assignment)
     if orphan_cues > 0:
         sys.stderr.write(
-            f"[WARN] {orphan_cues} dialogue cue(s) fall outside every shot time range "
-            "and are excluded from the aligned timeline.\n"
+            f"[FATAL] {orphan_cues} dialogue cue(s) could not be bound to any shot. "
+            "splice_screenplay.py treats an unclaimed subtitle as a fatal error, so the "
+            "screenplay cannot be assembled from this timeline.\n"
+        )
+        sys.exit(1)
+    if fallback_cues:
+        sys.stderr.write(
+            f"[WARN] {len(fallback_cues)} cue(s) had no shot with >{MIN_OVERLAP_MS}ms overlap "
+            f"and were bound to the nearest shot instead (sub_index: "
+            f"{[subtitles_data[i].get('index') for i in fallback_cues[:12]]}).\n"
         )
 
     aligned_shots = []
@@ -253,6 +314,8 @@ def main():
         "dialogue_shots": sum(1 for s in aligned_shots if s["shot_type"] == "DIALOGUE_SHOT"),
         "silent_action_shots": sum(1 for s in aligned_shots if s["shot_type"] == "SILENT_ACTION"),
         "total_dialogue_cues": len(subtitles_data),
+        "cues_assigned": len(sub_shot_assignment),
+        "cues_nearest_shot_fallback": len(fallback_cues),
         "unverified_visual_shots": unverified,
         "shots": aligned_shots
     }

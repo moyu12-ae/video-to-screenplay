@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
-from typing import List, Dict, Any
+from typing import List
 
 SCENE_FILTER_TIMEOUT_SEC = 3600.0
 DEFAULT_TIMEOUT_SEC = 120.0

@@ -79,7 +79,8 @@ probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随
 - **外挂字幕**（一级）：在 `materials/` 中检出 `.srt`/`.ass`。
 - **内嵌软字幕流**（二级）：用 ffmpeg 抽取（要求 `ffprobe_available: true`）。多语言轨时自动**优先用户语言**（`--lang`，默认 `chi,zho,chs,cht,zh`），并自动跳过 Forced / Signs / 歌曲类字幕牌轨（每条跳过都有 stderr 告警）；最终选择与被跳过的轨记录在 extracted.json 的 `embedded_stream` 字段备查。
 - **硬字幕 OCR**（三级）：望言 OCR MCP（`POST /import → /predet → /pipeline → /export`）。OCR 完成后由你把导出文本按规范 schema 落盘到 `.cache/subtitles/extracted.json`——`{"source_tier": "TIER_3_HARDCODED_OCR", "video_path": …, "items": [{"index": 1, "start_ms": …, "end_ms": …, "text": …}, …]}`（index 从 1 连续递增，时间用毫秒整数）。后续所有阶段只认这个文件。
-- 🛑 **快速失败**：纯画面素材且无任何字幕来源 → 运行 `python3 scripts/workspace.py check-subtitles --mode none`，它以退出码 5 结束。绝不编造台词。
+- 🟡 **只剩 OCR 档时不是拒止**：外挂与内封都落空 → `subtitle_extractor.py --require-subtitles` 先把 Tier 3 载荷（含 `status: NEEDS_OCR` 与 OCR 调用指令）打到 stdout，再以**退出码 6** 结束，等待你跑 OCR 并落盘 extracted.json。**绝不**在这一步退出码 5。
+- 🛑 **快速失败**：只有当你确认素材真的无对白（纯画面）时，才运行 `python3 scripts/workspace.py check-subtitles --mode none`，它以退出码 5 结束。绝不编造台词。
 
 ### 阶段 2 —— 双轨提取（并发）+ 声学说话人分离
 
@@ -105,14 +106,15 @@ wait $PID_VISUAL
   ```
   无客户端工具窗口——流式延迟约 0.5–1×音频时长（24 分钟单片 ≈ 10–20 分钟），**用后台任务执行**；瞬态错误（超时/连接/429/5xx/空补全）代码化指数退避（`V2S_OMNI_ATTEMPTS` 默认 3），单片失败不阻塞其余分片；**断点续跑**——重跑 `run` 只补缺失分片，`--force` 全部重做。单分片 >25 分钟会 WARN（改用 `prepare --chunk-seconds 1200` 重切）。日志只含异常类型+状态码+主机名，key 绝不落盘、绝不进日志。
 - **路径 B（回退）MCP 工具**——对工作单 `parts[]` 的每一片调用 MCP `omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：`file_path` = 分片绝对路径，`format: "json"`；`num_speakers` 仅当 bible 明确人数时传；`language` 默认不传（自动检测）。**上下文卫生**：此循环是纯机械动作（调工具 → 存文件），**委托一个子代理执行**——每片的工具返回（JSON 与 SRT 双份文本）只进子代理上下文，主会话只收"全部已保存"的一句结果；把每个返回的 JSON block 原样保存到工作单指定的 `output` 路径。
+- **静默片是完成片**：某片音频确实无人声时，模型返回 `{"segments": []}` 即视为该片已完成——重跑 `run` 会跳过它（`[SKIP] ... reported no speech`），不再为同一片段重复付费；merge 端只 WARN 不再以退出码 7 阻断。
 - 两条路径产物一致：`{"speakers": [...], "segments": [{"speaker","start","end","text"}]}`（秒制；直连多一个 `meta` 溯源块，merge 端忽略）。分离质量由模型音色聚类保证（对音乐/背景音鲁棒）；**Omni 转写文本只作证据**（`text_agreement` 校验用），绝不进剧本正文。
 
 ```bash
 python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
 ```
 
-- `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ **全局字幕-音频偏移估计**（字幕只是粗框，常整体超前音频 1–3 秒；±5s/0.25s 步长互相关求最优整体偏移，≥6 行才启用）→ 每条字幕按**校正后最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
-- 无 DASHSCOPE_API_KEY 且无 MCP 插件 / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
+- `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ **全局字幕-音频偏移估计**（字幕只是粗框，常整体超前音频 1–3 秒；±5s/0.25s 步长做整体滞后扫描、取总覆盖最大者，≥6 行才启用）→ 每条字幕按**校正后最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`（重叠按声学簇**累计**后再排序，故同簇多段短语音合计过半时不会漏记）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
+- 无 DASHSCOPE_API_KEY 且无 MCP 插件 / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。该产物自报底细：`acoustic_clustering_enabled: false`、`diarization_source.backend: "none"`——**读它的人必须看这两个字段**，降级产物绝不自称声学分结果。
 
 🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空；`speakers.json` 已产出（声学合并或 `--empty-fallback` 皆可）。
 
@@ -123,8 +125,9 @@ python3 scripts/semantic_scene_grouper.py --workspace "<ws>" > "<ws>/.cache/visu
 python3 scripts/align_timeline.py --workspace "<ws>" > "<ws>/.cache/alignment/aligned_timeline.json"
 ```
 
-- **分组器**：跨越台词的切点带一个较大且有限的惩罚（软约束——求解器绝不死锁成整集单一场景）；输出中的 `forced_dialogue_cuts` 列出最优解不得不切开的台词保护边界，stderr 会告警。装好 numpy/opencv 后，HSV 关键帧色板距离（LGSS 的 "place" 代理）会锐化边界；否则退化为静默/时长启发式并打印 `[INFO]`。
-- **对齐器**：每条台词被分配给且仅分配给一个镜头（取时间重叠最大者）；逐行给出 `OFF_SCREEN`/`VOICE_OVER`/`INTERNAL_MONOLOGUE` 标记；落在所有镜头之外的台词会计数并告警。
+- **分组器**：跨越台词的切点带一个较大且有限的惩罚（软约束——求解器绝不死锁成整集单一场景）；输出中的 `forced_dialogue_cuts` 列出最优解不得不切开的台词保护边界，stderr 会告警。装好 numpy/opencv 后，HSV 关键帧色板距离（LGSS 的 "place" 代理）会锐化边界；否则退化为静默/时长启发式并打印 `[INFO]`。`visual_affinity_enabled` 反映**实际可测边界数**（依赖装了但关键帧全缺 → false，并 WARN）；`visual_boundary_coverage` 给出 [可测, 总边界]。**零宏场景是致命错误**（退出码 1）——空 scenes.json 只会让成稿静默为空。
+- **层级模式**会忽略 `--target-scenes`/`--min-scenes`（每序列按自身粒度求解）——用到这两个 flag 时 stderr 明确告警，不静默吞参数。
+- **对齐器**：每条台词被分配给且仅分配给一个镜头（取时间重叠最大者）；达不到重叠门槛（>100ms）的台词**不会被丢弃**，而是绑到时间最近的镜头并点名告警（`cues_nearest_shot_fallback`）——拼装器把"从未被认领的字幕"判为致命错误，丢一条就等于把整集卡死在最后一步。有台词但无任何镜头 → 退出码 1，绝不产出空洞时间线。逐行给出 `OFF_SCREEN`/`VOICE_OVER`/`INTERNAL_MONOLOGUE` 标记。
 
 ### 阶段 3.5 —— 叙事大纲（可选；McKee 序列层）
 
@@ -134,7 +137,7 @@ python3 scripts/narrative_outline.py --workspace "<ws>"
 
 - 首次运行生成 `.cache/alignment/narrative_workorder.json`（全部台词流 + 大纲合同 + 目标 schema），并因 `narrative_structure.json` 缺失以**退出码 6** 提示待写。
 - agent 依合同写大纲：序列 = 价值转折单位（2-5 场递增收在序列高潮；给每个序列定题目；写明价值 from→to；边界落在转折点上；单集约 4-8 个序列；无对白段按时间自动归入相邻序列）。序列必须无缝覆盖全部 `sub_index`。
-- 重跑校验通过后，grouper 自动启用**层级模式**：序列墙吸附到最近物理切点（±15s，距离上报），逐序列独立求解场景（粒度自适应），每场继承 `sequence_title`/`sequence_value`，禁止跨序列成场；无大纲则与旧版完全一致的平切。
+- 重跑校验通过后，grouper 自动启用**层级模式**：序列墙吸附到 **15 秒窗口内**的最近物理切点；窗口内找不到切点时落在其之前最近的切点，并在 `wall_snaps[]` 标记 `within_snap_window: false` + stderr 告警（绝不假装吸附成功）。逐序列独立求解场景（粒度自适应），每场继承 `sequence_title`/`sequence_value`，禁止跨序列成场；单镜头配多序列大纲等退化输入会回落平切而非崩溃；无大纲则与旧版完全一致的平切。
 - 价值判定是理解任务，归 agent；切点归 DP——单模型约束下的分工。
 
 🔴 **检查点**：`total_macro_scenes` 合理（典型 8~35），`aligned_timeline.json` 覆盖全部台词。
@@ -153,7 +156,7 @@ manifest 是逐场**证据包**：`keyframes_thumbs`（640px 降采样帧）、�
    - 台词行按说话人合并：同一角色连续说话写一行、句间用全角斜杠——`**角色名**（提示）：[[SUB:2]]／[[SUB:3]]`；说话人切换才另起一行；
    - `△` 动作段是导演笔记，织在台词之间：演出指示、表演指导、镜头强调——写光、物、身体、声音；人物首次上镜写作 `△【角色】（特征）`；
    - `（画外）/【内心独白】` 括注、`△【插入：…】` 闪回、`（字幕卡：…）` 字幕。
-3. 硬规则：**绝不复打台词**——只允许占位符，每个 `sub_index` 恰好一次、按序出现；角色名只能来自 bible/manifest/台词中的称呼（陌生人物用描述性标签，绝不杜撰专有名词）；**目击者原则**——只写摄影机能拍到、录音机能录到的内容，零心理描写与回忆（不写"她想起……心中悔恨"，写"她动作僵住，攥紧拳头，指甲陷进肉里"——演员能演、摄影机能拍）；**Notnot 原则**——写"有什么"不写"没什么"，禁否定式动作句（不写"他没有回答"，写"他保持沉默"）；△ 禁止"两人交谈"式空泛句。
+3. 硬规则：**绝不复打台词**——只允许占位符，每个 `sub_index` 恰好一次、按序出现（顺序倒置现在是 `splice` 的致命错误，会点名出错的两条下标）；角色名只能来自 bible/manifest/台词中的称呼（陌生人物用描述性标签，绝不杜撰专有名词）；**目击者原则**——只写摄影机能拍到、录音机能录到的内容，零心理描写与回忆（不写"她想起……心中悔恨"，写"她动作僵住，攥紧拳头，指甲陷进肉里"——演员能演、摄影机能拍）；**Notnot 原则**——写"有什么"不写"没什么"，禁否定式动作句（不写"他没有回答"，写"他保持沉默"）；△ 禁止"两人交谈"式空泛句。
 
 完整契约内嵌于 `manifest.instructions`。随时可重跑 builder——它会报告 `drafts_written` / `drafts_missing`（检查点/续跑）。
 
@@ -176,18 +179,22 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 
 | 失败情形 | 信号 | 响应 |
 | :--- | :--- | :--- |
-| 完全没有字幕 | probe 为空 + 用户确认 | 硬性拒绝，退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
+| 完全没有字幕 | 用户确认素材无对白 | 硬性拒绝：`workspace.py check-subtitles --mode none` 退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
+| 只有硬字幕（无外挂/无内封） | 提取器 **退出码 6** + stdout 带 `status: NEEDS_OCR` | 这是出路不是拒止：按 Tier 3 指令跑 OCR，把结果落盘 `extracted.json` 后继续；**不要**误当作无字幕直接退出码 5 |
 | 阶段 1 未配置 DASHSCOPE_API_KEY | doctor 报告 `diarization.dashscope_api_key=missing` | AskUserQuestion 显式三选一（配 key 重跑 / 降级继续 / 中止）；选择降级后 `run` 仍会以退出码 8 二次拦截 |
 | 无 DASHSCOPE_API_KEY（路径 A 首次执行） | run **退出码 8** | 三选一：配 key 重跑 run；走路径 B 调 MCP；`merge --empty-fallback` 全 null 继续 |
 | 直连单片网络瞬态（超时/连接/429/5xx/空补全） | run 内已自动指数退避重试（`V2S_OMNI_ATTEMPTS` 默认 3） | 重试耗尽的分片报 ERROR 但不阻塞其余；处置后重跑 `run` 只补缺 |
 | 直连单调用近超时天花板（超长分片） | run 对 >25 分钟分片 WARN；调用死于超时 | `prepare --chunk-seconds 1200` 重切后重跑 `run` |
 | Omni 输出缺失/非法/分片不全 | merge **退出码 7** 并点名文件 | 重跑 `run`（断点续跑只补缺）或按工作单补做对应分片的 MCP 调用，再重跑 `merge` |
+| 某个分片确实无人声（片头曲/纯动作段） | `run` 打 `[SKIP] ... (reported no speech)`；merge 只 WARN | 静默片算已完成，**不要** `--force` 反复重调付费接口；若怀疑漏识别，用 `prepare --chunk-seconds` 重切该段 |
 | 单次 MCP 调用超时/失败（路径 B：客户端执行窗口、上游波动） | 工具执行超时或连接中断 | `prepare --chunk-seconds 30~40` 重切后逐片重调（上游不稳时等待 1–3 分钟再试），或改走路径 A |
 | 视频无音频流 | 工作单 `status=no_audio_stream` | 直接 `merge --empty-fallback`；对白只存在于字幕层，流水线不受影响 |
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
 | 内嵌轨疑似纯字幕牌（SIGN/Forced） | extracted.json 的 `embedded_stream.reason=last_resort_all_look_like_signs`，或行文本多为画面文字 | 用 `--lang` 指定其他语言轨重抽；多轨源可显式映射对白轨重剪（`ffmpeg -map 0:<idx>`） |
 | 缺 FFmpeg | scene_detect 退出码 3 / doctor 退出码 3 | 停止，原样上报，绝不借用无关 MCP |
+| 分组器零宏场景 | **退出码 1** 并报出镜头/台词数 | 空 scenes.json 会让成稿静默为空：检查 shots.json 时间码；层级模式下检查大纲 sub 区间是否覆盖全片 |
+| 台词落在所有镜头之外 | 对齐器 WARN + `cues_nearest_shot_fallback` | 无需干预：自动绑到最近镜头；若计数异常偏高，说明切镜时间码或字幕时间基有问题 |
 | 分组器 `forced_dialogue_cuts > 0` | stderr WARN | 可能出现台词中途切场；检查字幕对齐 / `--max-scenes` 余量 |
 | 镜头数超出 `40 × max_scenes` | （旧版会静默塌缩成 1 场） | 求解窗已自动加宽至 `⌈镜头数 / max_scenes⌉` 自愈；若仍见"collapse into a single scene" WARN，调大 `--max-scenes` |
 | 关键帧抓取失败 | `failed_keyframes[]`（shots.json → scenes.json → aligned_timeline 全程透传） | 无已验证帧的场在时间线里 `visual_verified: false`；草稿不得描写它们 |
@@ -205,6 +212,9 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 把暂定标签渲染成真名 | `SPEAKER_*`（含声学 `SPEAKER_A*`）/ 未归属 → `人物`，直到场景理解 pass 给出命名 |
 | 用 Omni 转写文本代替字幕台词 | 转写仅作 `text_agreement` 证据；台词一律 `[[SUB:n]]` 逐字来自字幕 |
 | 把 API key 写进代码/命令行/证据文件 | key 只从环境变量读（无 key 时 run 以退出码 8 拒绝）；日志只含异常类型+状态码+主机名 |
+| 让降级产物冒充声学结论 | `merge --empty-fallback` 写出的 `speakers.json` 必须自报 `acoustic_clustering_enabled: false` + `backend: "none"`；下游判断说话人列是否可用只看这两个字段，绝不靠"有没有名字"猜 |
+| 在对齐阶段丢弃低重叠台词 | 每条台词必须有着落（重叠不足则绑最近镜头并上报）：拼装器把"从未被认领"判为致命，丢一条就等于把整集卡死在最后一步 |
+| 把静默分片当失败反复重调 | 模型明确返回空 `segments` 就是完成态；反复 `run`/`--force` 只会重复付费 |
 | 用字幕元数据改判声学归属 | 元数据只给声学簇**投票起名**（份额 ≥0.6、≥2 票）；"谁在说"永远由音色聚类决定 |
 | 幻觉动作行 | 动作草稿只写关键帧可见内容；未验证的镜头保持未验证 |
 | 在 DP 中硬禁台词切点 | 软惩罚 + `forced_dialogue_cuts` 报告——绝不用硬 INF 静默地把整集塌缩成一场 |

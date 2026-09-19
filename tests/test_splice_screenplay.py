@@ -9,10 +9,12 @@ placeholders must abort), the verbatim injection, the speaker-name lint, and
 the assembly tables.
 """
 
-import json
+import io
+import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 SCRIPTS_DIR = (Path(__file__).parent.parent / "scripts").resolve()
@@ -108,6 +110,23 @@ class TestValidateAndSplice(unittest.TestCase):
             sp.validate_and_splice(
                 [self.drafts / "scene_01.md", self.drafts / "scene_02.md"], self.expected, extra
             )
+
+    def test_out_of_order_placeholders_are_fatal(self):
+        """SKILL.md requires 按序出现; coverage alone was checked as a set, so a draft
+        could present 第二句 before 第一句 and still assemble cleanly."""
+        swapped = (SCENE_1.replace("[[SUB:1]]", "[[TMP]]").replace("[[SUB:2]]", "[[SUB:1]]")
+                   .replace("[[TMP]]", "[[SUB:2]]"))
+        self.assertEqual(re.findall(r"SUB:(\d)", swapped), ["2", "1"])
+        write_scene(self.drafts, 1, swapped)
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stderr(buf):
+                sp.validate_and_splice(
+                    [self.drafts / "scene_01.md", self.drafts / "scene_02.md"],
+                    self.expected, self.verbatim)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("out of subtitle order", buf.getvalue())
+        self.assertIn("[[SUB:2]] before [[SUB:1]]", buf.getvalue())
 
     def test_nonexistent_sub_index_is_fatal(self):
         write_scene(self.drafts, 1, SCENE_1 + "\n**菈菈**\n[[SUB:999]]\n")

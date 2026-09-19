@@ -125,6 +125,17 @@ def validate_and_splice(
             )
             sys.exit(1)
 
+        reversed_pairs = [(a, b) for a, b in zip(found, found[1:]) if b < a]
+        if reversed_pairs:
+            # SKILL.md states the placeholders must appear 按序; only set membership was
+            # checked, so a draft could reorder dialogue and the screenplay would read
+            # out of chronological sequence while every check stayed green.
+            sys.stderr.write(
+                f"[FATAL] scene_{pos:02d}.md lists {len(reversed_pairs)} placeholder(s) out of subtitle "
+                f"order (e.g. [[SUB:{reversed_pairs[0][0]}]] before [[SUB:{reversed_pairs[0][1]}]]). "
+                "Dialogue must appear in subtitle-index (chronological) order within a scene.\n")
+            sys.exit(1)
+
         if not ANY_HEADING_RE.search(text):
             warnings.append(f"scene_{pos:02d}: 缺少场次 H2 标题行（## 场 N【标题】）")
 
@@ -353,8 +364,8 @@ def main():
         "| :--- | :--- |",
         f"| **台词来源** | {extracted.get('source_detail', '')}，{len(verbatim)} 条，由占位符逐字回填 |",
         f"| **分镜来源** | {shots_doc.get('total_scenes', '?')} 个镜头，{total_scenes} 个宏场景（LGSS-DP + 关键帧色板亲和度） |",
-        f"| **体例** | 中文场号制（H2 场头【标题】+ △ 视听动作段 + 同一说话人连续台词以／合并；台词一字未改） |",
-        f"| **生成** | Video-to-Screenplay Pipeline v2（证据包 → LLM 写作 → 占位符回填校验） |",
+        "| **体例** | 中文场号制（H2 场头【标题】+ △ 视听动作段 + 同一说话人连续台词以／合并；台词一字未改） |",
+        "| **生成** | Video-to-Screenplay Pipeline v2（证据包 → LLM 写作 → 占位符回填校验） |",
         "",
         "---",
         "",

@@ -1,0 +1,58 @@
+name: CI
+
+# The pipeline's contract is that numpy/opencv are OPTIONAL and the grouper degrades
+# without them, so both legs run: one with the visual path armed, one stdlib-only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        optional-deps: [with, without]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install optional visual dependencies
+        if: matrix.optional-deps == 'with'
+        run: python -m pip install -r requirements.txt
+
+      - name: Install pytest
+        run: python -m pip install "pytest>=8.0"
+
+      - name: Byte-compile every stage script
+        run: python -m compileall -q scripts tests
+
+      - name: Run the suite
+        run: python -m pytest tests/ -q
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Fail on unused imports and undefined names
+        run: |
+          python -m pip install "ruff>=0.4"
+          python -m ruff check scripts tests --select F
