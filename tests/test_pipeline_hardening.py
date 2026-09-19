@@ -44,8 +44,7 @@ ITEMS = [{"index": 1, "start_ms": 1000, "end_ms": 2000, "text": "第一句"},
 
 
 def _write_bom(path, text):
-    with open(path, "wb") as f:
-        f.write(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    Path(path).write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
 
 
 class TestSubtitleFileParsing(unittest.TestCase):
