@@ -60,7 +60,7 @@
 | :--- | :--- | :--- |
 | Claude Code | `.claude-plugin/plugin.json` + `marketplace.json` | `/plugins` → 把本仓库添加为市场（`moyu12-ae/video-to-screenplay`）后安装 |
 | ZCode | `.zcode-plugin/plugin.json` | 同以往，从本仓库安装 |
-| Qoder | `.qoder-plugin/plugin.json` | 添加市场安装，或本地安装包。⚠️ **本地手动**路线（把包放到 `~/.qoder-cn/plugins`，并在 `installed_plugins_v2.json` 与 `enabledPlugins` 注册启用）**我们尚未端到端实测**，在验证前请当作未验证路径 |
+| Qoder | `.qoder-plugin/plugin.json` | 添加市场安装，或本地安装——**已实测可用**：把包拷到 `~/.qoder-cn/plugins/local/video-to-screenplay/<版本>/`（含 `.qoder-plugin/`、`skills/`、`commands/`、`scripts/`、`SECURITY.md`），在 `~/.qoder-cn/plugins/installed_plugins_v2.json` 加一条 `video-to-screenplay@local`（`scope: user`、绝对 `installPath`、`marketId: "local"`），在 `~/.qoder-cn/settings.json` 里置 `enabledPlugins["video-to-screenplay@local"] = true`，然后**重启 Qoder**——插件集只在进程启动时读取一次，生效后技能会以 `video-to-screenplay:video-to-screenplay` 出现。包是快照拷贝，仓库改动后需重新拷贝 |
 
 ### 宿主内使用
 
@@ -71,6 +71,12 @@
 /video-to-screenplay:build     # 阶段 2-4：双轨提取、分组、对齐、证据包、逐场撰写
 /video-to-screenplay:splice    # 阶段 5：逐字拼装 + 交付复查清单
 ```
+
+> **宿主差异（2026-09-19 在 Qoder 桌面端实测）：**该宿主的插件命令**既不列出也不执行**——`@`/`/` 选择器
+> 只列插件、技能、MCP server 与 agent，从不列命令；完整敲 `/video-to-screenplay:init` 会当作普通文本发进来。
+> 这不是打包缺陷：同一个选择器里 `context7` 的 `/context7:docs` 同样不显示，而它的插件、MCP server、agent
+> 都在，且我们的命令文件与该参照包形状完全一致。在 Qoder 下直接说要做哪一段即可（"跑阶段 1"、"把证据包做出来"）——
+> `SKILL.md` 里有同样的阶段顺序、命令与检查点。命令在会展示斜杠命令的宿主（如 Claude Code）下可用。
 
 或直接运行技能：
 

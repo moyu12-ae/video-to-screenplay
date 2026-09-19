@@ -58,7 +58,7 @@ only the manifest differs per host. `tests/test_packaging.py` pins name/version 
 | :--- | :--- | :--- |
 | Claude Code | `.claude-plugin/plugin.json` + `marketplace.json` | `/plugins` → add this repo as a marketplace (`moyu12-ae/video-to-screenplay`), then install |
 | ZCode | `.zcode-plugin/plugin.json` | install from this repo as before |
-| Qoder | `.qoder-plugin/plugin.json` | add the marketplace, or install the package locally. ⚠️ The **local/manual** route (placing the package under `~/.qoder-cn/plugins` and registering it in `installed_plugins_v2.json` + `enabledPlugins`) has **not been verified end-to-end by us yet** — treat it as untested until it is |
+| Qoder | `.qoder-plugin/plugin.json` | add the marketplace, or install locally — **verified working**: copy the package to `~/.qoder-cn/plugins/local/video-to-screenplay/<version>/` (`.qoder-plugin/`, `skills/`, `commands/`, `scripts/`, `SECURITY.md`), add a `video-to-screenplay@local` entry to `~/.qoder-cn/plugins/installed_plugins_v2.json` (`scope: user`, absolute `installPath`, `marketId: "local"`), set `enabledPlugins["video-to-screenplay@local"] = true` in `~/.qoder-cn/settings.json`, then **restart Qoder** — the plugin set is read at process start, and the skill then appears namespaced `video-to-screenplay:video-to-screenplay`. The package is a snapshot copy, so re-copy after repo changes |
 
 ### Inside the host
 
@@ -70,6 +70,14 @@ pipeline's natural resume boundaries:
 /video-to-screenplay:build     # stages 2-4: tracks, grouping, alignment, evidence packs, scene drafts
 /video-to-screenplay:splice    # stage 5: verbatim splice + delivery checklist
 ```
+
+> **Host difference, measured on Qoder desktop (2026-09-19):** plugin **commands are neither listed nor
+> invoked there** — the `@`/`/` picker surfaces plugins, skills, MCP servers and agents, never commands,
+> and typing the full `/video-to-screenplay:init` arrives as literal text. This is not a packaging defect:
+> the same picker hides `context7`'s `/context7:docs` while showing its plugin, MCP server and agent, and
+> our command files are shape-identical to that reference package. On Qoder, just say what stage you want
+> ("跑阶段 1", "build the evidence packs") — `SKILL.md` carries the same stage order, commands and
+> checkpoints. The commands work where slash commands are surfaced (e.g. Claude Code).
 
 Or run the skill directly:
 
