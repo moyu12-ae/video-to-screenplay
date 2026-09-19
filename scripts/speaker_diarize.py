@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import omni_client
+import op_ed
 
 SPEAKER_LABEL_RE = re.compile(r"^SPEAKER_[A-Z0-9]+$")
 
@@ -1017,6 +1018,18 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
     parts_used, turns, metas = load_omni_parts(ws)
     backend = ("direct_api" if any(isinstance(m, dict) and m.get("backend") == "direct_api"
                                    for m in metas) else "mcp_tool")
+
+    # OP/ED windows (v0.5.1): songs are not characters. Turns sitting inside a
+    # configured window are dropped BEFORE clustering, so the singer never
+    # reaches characters_manifest or the writer's cast list.
+    op_ed_windows = op_ed.load_windows(ws)
+    if op_ed_windows and turns:
+        before = len(turns)
+        turns = [t for t in turns
+                 if op_ed.matching_label(t["start_ms"], t["end_ms"], op_ed_windows) is None]
+        if len(turns) != before:
+            sys.stderr.write(f"[INFO] OP/ED filter: dropped {before - len(turns)} speech turn(s) "
+                             "inside configured windows (songs are not characters)\n")
 
     if not turns:
         rows, cluster_lines = bind_lines(items, [])

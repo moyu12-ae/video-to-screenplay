@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,14 @@ from unittest import mock
 
 SCRIPTS_DIR = (Path(__file__).parent.parent / "scripts").resolve()
 sys.path.insert(0, str(SCRIPTS_DIR))
+
+
+def _tmp_file(suffix: str) -> Path:
+    """A safely unpredictable temp file (mkstemp), closed immediately for
+    Path-level use in tests."""
+    fd, name = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return Path(name)
 
 from subtitle_extractor import extract_speaker_from_text
 from speaker_diarize import (
@@ -41,14 +50,18 @@ from speaker_diarize import (
     snap_boundaries,
 )
 import omni_client
+import op_ed
 import workspace
 from align_timeline import infer_av_relationship
 from subtitle_extractor import select_embedded_stream
+from omni_client import build_video_part, fit_video, understand_video_segment
 from av_understand import (
     build_prompt,
     cmd_merge as av_merge,
     cmd_prepare as av_prepare,
     cmd_run as av_run,
+    dedup_entries,
+    has_substance,
     parse_note,
     plan_segments,
     scene_coverage,
@@ -732,10 +745,20 @@ class TestWorkspaceDoctor(unittest.TestCase):
 class TestAvUnderstand(unittest.TestCase):
     """Stage 3.7 pure planning + cmd_run/prepare integration (no network, no ffmpeg)."""
 
-    def test_plan_segments_splits_with_overlap_and_tail_fold(self):
+    def test_plan_segments_splits_without_exceeding_cap(self):
+        """200s -> three windows all <= 90s: the old 45s tail fold let the last
+        window balloon to 115s while three docs promised <= 90s."""
         segs = plan_segments([{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 200_000}])
         self.assertEqual([(s["start_ms"], s["end_ms"]) for s in segs],
-                         [(0, 90_000), (85_000, 200_000)])  # 5s overlap; 25s tail folded
+                         [(0, 90_000), (85_000, 175_000), (170_000, 200_000)])
+        self.assertTrue(all(s["end_ms"] - s["start_ms"] <= 90_000 for s in segs))
+
+    def test_plan_segments_folds_tiny_tail_within_documented_exception(self):
+        """A <10s tail folds into the last window: 91s stays ONE segment (90s cap
+        + documented 10s fold exception) instead of paying a full call for a 1s
+        sliver."""
+        segs = plan_segments([{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 91_000}])
+        self.assertEqual([(s["start_ms"], s["end_ms"]) for s in segs], [(0, 91_000)])
 
     def test_plan_segments_short_scene_single_window(self):
         segs = plan_segments([{"scene_id": "SCENE_01", "start_ms": 30_000, "end_ms": 90_000}])
@@ -745,7 +768,7 @@ class TestAvUnderstand(unittest.TestCase):
         segs = plan_segments([{"scene_id": "A", "start_ms": 0, "end_ms": 100_000},
                               {"scene_id": "B", "start_ms": 100_000, "end_ms": 120_000}])
         self.assertTrue(all(s["scene_id"] in ("A", "B") for s in segs))
-        self.assertEqual([s["end_ms"] for s in segs if s["scene_id"] == "A"], [100_000])
+        self.assertEqual([s["end_ms"] for s in segs if s["scene_id"] == "A"], [90_000, 100_000])
         self.assertEqual([s["start_ms"] for s in segs if s["scene_id"] == "B"], [100_000])
 
     def test_parse_note_shifts_to_absolute_and_drops_garbage(self):
@@ -768,6 +791,29 @@ class TestAvUnderstand(unittest.TestCase):
         self.assertEqual(note["acoustic"]["events"][0]["start"], 422_200)
         self.assertEqual(note["acoustic"]["music_mood"], "紧张")
         self.assertEqual(note["uncertain"], ["第 40s 附近人物身份无法确认"])
+
+    def test_parse_note_accepts_key_aliases_and_time_strings(self):
+        """Models drift between start/start_time and what/description; a MM:SS
+        string timebase must parse instead of silently vanishing."""
+        note = parse_note({
+            "visual": {"actions": [
+                {"start_time": 5.0, "end_time": 8.0, "who": "红衣女子", "description": "撑伞快走"},
+                {"start": "00:01:05", "end": "00:01:08", "who": "老者", "what": "驻足"}]},
+        }, 100_000, 190_000)
+        self.assertEqual(note["visual"]["actions"],
+                         [{"who": "红衣女子", "what": "撑伞快走", "start": 105_000, "end": 108_000},
+                          {"who": "老者", "what": "驻足", "start": 165_000, "end": 168_000}])
+
+    def test_parse_note_drops_out_of_timebase_and_counts(self):
+        """A 200s timestamp inside a 90s window means the model ignored the local
+        timebase - dropping it beats clamping it into a confident wrong timecode."""
+        note = parse_note({
+            "visual": {"actions": [
+                {"start": 200.0, "end": 210.0, "who": "B", "what": "越界"},
+                {"start": 2.0, "end": 3.0, "who": "D", "what": "正常"}]},
+        }, 100_000, 190_000)
+        self.assertEqual([a["what"] for a in note["visual"]["actions"]], ["正常"])
+        self.assertEqual(note["dropped"]["actions"], 1)
 
     def test_parse_note_survives_non_dict_input(self):
         for garbage in (None, [], "x", 42):
@@ -851,7 +897,7 @@ class TestAvUnderstand(unittest.TestCase):
                     av_prepare(str(ws), 90.0, None)
             self.assertEqual(ctx.exception.code, 0)
             work = json.loads((ws / ".cache" / "av" / "av_workorder.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(work["segments"]), 2)  # 200s scene -> 2 segments
+            self.assertEqual(len(work["segments"]), 3)  # 200s scene -> [90, 90, 20]s, all <= cap
             self.assertTrue((ws / ".cache" / "av" / "seg_000.mp4").is_file())
 
     def test_cmd_run_writes_notes_and_av_notes_json(self):
@@ -865,10 +911,11 @@ class TestAvUnderstand(unittest.TestCase):
         stub.assert_called_once()
         self.assertTrue((av_dir / "av_note_000.json").is_file())
         notes = json.loads((ws / ".cache" / "visual" / "av_notes.json").read_text(encoding="utf-8"))
-        self.assertEqual(notes["schema"], "vts-av-notes/v1")
+        self.assertEqual(notes["schema"], "vts-av-notes/v2")
         self.assertEqual(notes["scene_notes"][0]["covered_pct"], 100.0)
         self.assertEqual(notes["scene_notes"][0]["segments"][0]["visual"]["actions"][0]["start"],
                          1_000)  # local 1.0s -> absolute 1000ms
+        self.assertTrue(notes["scene_notes"][0]["segments"][0]["substantive"])
 
     def test_cmd_run_missing_key_exits_8(self):
         ws, _ = self._make_ws([{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 60_000}],
@@ -915,6 +962,191 @@ class TestAvUnderstand(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 av_merge(str(ws))
         self.assertEqual(ctx.exception.code, 7)
+
+
+class TestOpEdWindows(unittest.TestCase):
+    """OP/ED window config: bible.json is the single source; spans >=50% inside
+    a window are non-narrative; filtered lines reindex contiguously."""
+
+    def test_load_windows_from_bible(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "materials").mkdir()
+            (ws / "materials" / "bible.json").write_text(json.dumps({
+                "op_ed_windows": [
+                    {"start_ms": 84000, "end_ms": 105000, "label": "OP"},
+                    {"start_ms": 1440000, "end_ms": 1320000},           # inverted -> skipped
+                    {"start_ms": "x", "end_ms": 5},                     # malformed -> skipped
+                ]}), encoding="utf-8")
+            windows = op_ed.load_windows(str(ws))
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["label"], "OP")
+
+    def test_load_windows_without_config_is_noop(self):
+        self.assertEqual(op_ed.load_windows(None), [])
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(op_ed.load_windows(td), [])
+
+    def test_matching_label_threshold(self):
+        windows = [{"start_ms": 84000, "end_ms": 105000, "label": "OP"}]
+        self.assertEqual(op_ed.matching_label(84000, 105000, windows), "OP")     # fully inside
+        self.assertEqual(op_ed.matching_label(84000, 104000, windows), "OP")     # >= 50%
+        self.assertIsNone(op_ed.matching_label(83000, 85000, windows))           # 50% boundary line kept
+        self.assertIsNone(op_ed.matching_label(0, 60000, windows))               # narrative
+
+    def test_filter_items_reindexes_and_records(self):
+        windows = [{"start_ms": 84000, "end_ms": 105000, "label": "OP"}]
+        items = [{"index": 1, "start_ms": 1000, "end_ms": 2000, "text": "a"},
+                 {"index": 2, "start_ms": 90000, "end_ms": 91000, "text": "歌词"},
+                 {"index": 3, "start_ms": 120000, "end_ms": 121000, "text": "b"},
+                 {"index": 4, "start_ms": 100000, "end_ms": 101000, "text": "歌词2"}]
+        kept, meta = op_ed.filter_items(items, windows)
+        self.assertEqual([it["text"] for it in kept], ["a", "b"])
+        self.assertEqual([it["index"] for it in kept], [1, 2])   # contiguous [[SUB:n]] contract
+        self.assertEqual(meta["removed"], {"OP": 2})
+        self.assertEqual(meta["removed_total"], 2)
+
+    def test_filter_items_no_windows_is_identity(self):
+        items = [{"index": 1, "start_ms": 0, "end_ms": 1, "text": "a"}]
+        kept, meta = op_ed.filter_items(items, [])
+        self.assertIs(kept, items)
+        self.assertEqual(meta, {})
+
+
+class TestAvHardening(unittest.TestCase):
+    """The review-driven fixes: substance gate, dedup, transport shape, orphan
+    cleanup, no second model call for a JSON problem."""
+
+    def test_has_substance_and_is_valid_note_reject_empty_evidence(self):
+        self.assertFalse(has_substance(parse_note({}, 0, 1000)))
+        self.assertFalse(has_substance(parse_note({"visual": {}}, 0, 1000)))
+        self.assertTrue(has_substance(parse_note(
+            {"visual": {"caption": "雨夜"}}, 0, 1000)))
+        p = _tmp_file(".json")
+        p.write_text(json.dumps({"raw": {}, "meta": {}}), encoding="utf-8")
+        try:
+            self.assertFalse(av_understand_module._is_valid_note(p))  # used to be True
+        finally:
+            p.unlink()
+
+    def test_dedup_entries_merges_overlap_zone_duplicates(self):
+        previous = [{"start": 0, "end": 90_000, "who": "红衣女子", "what": "转身看窗"}]
+        entries = [
+            {"start": 87_500, "end": 89_500, "who": "红衣女子", "what": "转身看窗。"},  # dup in overlap
+            {"start": 95_000, "end": 99_000, "who": "红衣女子", "what": "坐下"},        # new
+        ]
+        kept = dedup_entries(entries, previous, "what")
+        self.assertEqual([e["what"] for e in kept], ["坐下"])
+        self.assertEqual(previous[0]["end"], 90_000)  # span extension stays inside the dup itself
+
+    def test_dedup_entries_keeps_distinct_entries(self):
+        previous = [{"start": 0, "end": 5_000, "who": "A", "what": "转身看窗"}]
+        entries = [{"start": 1_000, "end": 4_000, "who": "B", "what": "系鞋带"}]
+        self.assertEqual(len(dedup_entries(entries, previous, "what")), 1)
+
+    def test_build_video_part_shape(self):
+        p = _tmp_file(".mp4")
+        p.write_bytes(b"\x00" * 16)
+        try:
+            part = build_video_part(str(p), fps=2.0, max_pixels=100_000)
+            self.assertEqual(part["type"], "video_url")
+            self.assertTrue(part["video_url"]["url"].startswith("data:video/mp4;base64,"))
+            # fps/max_pixels MUST sit at the part's top level - the endpoint only
+            # honors them there
+            self.assertEqual(part["fps"], 2.0)
+            self.assertEqual(part["max_pixels"], 100_000)
+            self.assertNotIn("fps", part["video_url"])
+            self.assertTrue(part["use_audio_in_video"])
+        finally:
+            p.unlink()
+
+    def test_understand_video_segment_does_not_rebill_on_bad_json(self):
+        p = _tmp_file(".mp4")
+        p.write_bytes(b"\x00" * 16)  # tiny -> fit_video passthrough, no ffmpeg
+        try:
+            with mock.patch.object(omni_client, "call_omni_chat",
+                                   return_value=("this is not json at all", {})) as stub:
+                with self.assertRaises(ValueError):
+                    understand_video_segment(str(p), prompt="p", api_key="k")
+            self.assertEqual(stub.call_count, 1)  # no second model call for a JSON problem
+        finally:
+            p.unlink()
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_fit_video_ladder_cleans_orphans(self):
+        src = _tmp_file(".mp4")
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "testsrc=duration=2:size=640x480:rate=10",
+                        "-c:v", "libx264", "-preset", "ultrafast", str(src)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        try:
+            payload, fmt = fit_video(str(src), budget=src.stat().st_size - 1)
+            self.assertLessEqual(payload.stat().st_size, src.stat().st_size - 1)
+            self.assertEqual(fmt, "mp4")
+            leftovers = [o for o in src.parent.glob(f".fitv_{src.stem}_*.mp4") if o != payload]
+            self.assertEqual(leftovers, [])           # success path leaves no busted tiers
+            payload.unlink(missing_ok=True)
+        finally:
+            src.unlink(missing_ok=True)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg required")
+    def test_fit_video_impossible_budget_raises_without_orphans(self):
+        src = _tmp_file(".mp4")
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "testsrc=duration=2:size=640x480:rate=10",
+                        "-c:v", "libx264", "-preset", "ultrafast", str(src)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        try:
+            with self.assertRaises(ValueError):
+                fit_video(str(src), budget=1)
+            self.assertEqual(list(src.parent.glob(f".fitv_{src.stem}_*.mp4")), [])  # every busted tier cleaned
+        finally:
+            src.unlink(missing_ok=True)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg required")
+    def test_end_to_end_prepare_cut_merge_roundtrip(self):
+        """The no-network E2E leg: real ffmpeg cut -> fake evidence -> merge ->
+        av_notes.json on disk with a summary (not the whole document) on stdout."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "materials").mkdir()
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "testsrc=duration=30:size=320x240:rate=10",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=30",
+                            "-shortest", "-c:v", "libx264", "-preset", "ultrafast",
+                            "-c:a", "aac", str(ws / "materials" / "clip.mp4")],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+            (ws / ".cache" / "visual").mkdir(parents=True)
+            (ws / ".cache" / "visual" / "scenes.json").write_text(json.dumps(
+                {"scenes": [{"scene_id": "SCENE_01", "start_ms": 0, "end_ms": 30_000}]}),
+                encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    av_prepare(str(ws), 90.0, None)
+            self.assertEqual(ctx.exception.code, 0)
+            payload = ws / ".cache" / "av" / "seg_000.mp4"
+            self.assertTrue(payload.is_file())
+            probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                    "format=duration", "-of", "csv=p=0", str(payload)],
+                                   stdout=subprocess.PIPE, text=True, timeout=30)
+            self.assertAlmostEqual(float(probe.stdout.strip()), 30.0, delta=1.5)
+
+            (ws / ".cache" / "av" / "av_note_000.json").write_text(json.dumps({
+                "raw": {"visual": {"caption": "测试画面", "actions": [], "camera": [],
+                                   "scene_transition": "无"},
+                        "visible_text": [], "acoustic": {"events": [], "music_mood": "无"},
+                        "uncertain": []},
+                "meta": {"usage": {"total_tokens": 6397}}}), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                av_merge(str(ws))
+            summary = json.loads(out.getvalue())
+            self.assertEqual(summary["scenes"], 1)
+            self.assertEqual(summary["covered_min"], 100.0)
+            self.assertEqual(summary["tokens"], 6397)
+            self.assertTrue((ws / ".cache" / "visual" / "av_notes.json").is_file())
+            self.assertNotIn('"scene_notes"', out.getvalue())  # stdout is a summary, not the document
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import op_ed
+
 THUMB_WIDTH = 640
 
 WRITING_CONTRACT = """\
@@ -236,6 +238,11 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
 
     drafts_dir.mkdir(parents=True, exist_ok=True)
 
+    # OP/ED windows (v0.5.1): scenes sitting inside a configured window are not
+    # narrative - the builder writes their one-line stub itself, so the writer
+    # never sees them and splice still gets a file per scene.
+    op_ed_windows = op_ed.load_windows(ws)
+
     manifest_scenes: List[Dict[str, Any]] = []
     for sc in macro_scenes:
         sid = str(sc.get("scene_id") or "")
@@ -245,6 +252,12 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
         draft_name = f"scene_{idx:02d}.md"
         draft_path = drafts_dir / draft_name
         originals = sample_keyframes(shots, start_ms, end_ms, keyframes_dir, max_keyframes)
+        op_ed_label = op_ed.matching_label(start_ms, end_ms, op_ed_windows)
+        if op_ed_label and not draft_path.is_file():
+            # The stub IS the deliverable for these scenes: one line in the final
+            # screenplay saying what the window is, nothing for the writer to do.
+            draft_path.write_text(f"## 场 {idx}【{op_ed_label}】\n\n（动画 {op_ed_label}——按配置略）\n",
+                                  encoding="utf-8")
         manifest_scenes.append({
             "scene_index": idx,
             "scene_id": sid,
@@ -255,12 +268,15 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
             "sequence_index": sc.get("sequence_index"),
             "sequence_title": sc.get("sequence_title", ""),
             "sequence_value": sc.get("sequence_value", ""),
-            "keyframes_thumbs": make_thumbs(originals, thumbs_dir / f"scene_{idx:02d}", THUMB_WIDTH),
+            "keyframes_thumbs": [] if op_ed_label else make_thumbs(
+                originals, thumbs_dir / f"scene_{idx:02d}", THUMB_WIDTH),
             "av_notes": av_by_scene.get(sid),
+            "op_ed": op_ed_label,
             "child_shot_count": sc.get("child_shot_count"),
             "dialogues": dialogues_by_scene.get(sid, []),
             "draft_path": str(draft_path),
-            "draft_status": "written" if draft_path.is_file() else "missing",
+            "draft_status": ("op_ed" if op_ed_label else
+                             ("written" if draft_path.is_file() else "missing")),
         })
 
     return {

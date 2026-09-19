@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 from typing import List, Dict, Any, Optional, Tuple
 
+import op_ed
+
 
 def require_ffprobe() -> bool:
     """Report whether the FFmpeg tooling needed by Tier 2 is reachable on PATH."""
@@ -493,6 +495,19 @@ def main():
 
     extractor = SubtitleExtractor(video_input, external_sub, args.lang)
     res = extractor.extract()
+
+    # OP/ED window filter (v0.5.1): configured in materials/bible.json → the
+    # lines never reach any downstream stage (outline / aligner / manifest /
+    # splice see a clean contiguous stream). Survivors are reindexed 1..N, and
+    # what was removed is recorded here for audit - nothing vanishes silently.
+    windows = op_ed.load_windows(ws)
+    if windows and res.get("items"):
+        res["items"], res["op_ed_filtered"] = op_ed.filter_items(res["items"], windows)
+        res["subtitle_count"] = len(res["items"])
+        removed = res["op_ed_filtered"]["removed"]
+        sys.stderr.write(f"[INFO] OP/ED filter: removed {res['op_ed_filtered']['removed_total']} "
+                         f"subtitle line(s) inside configured windows {removed or {}}; "
+                         f"{res['subtitle_count']} dialogue lines remain\n")
 
     # Output pure JSON to stdout (standard UNIX filter pattern). This happens BEFORE
     # any exit code: the payload is the only channel that carries the Tier 3 OCR

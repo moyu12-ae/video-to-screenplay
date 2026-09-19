@@ -296,3 +296,36 @@
   heuristic-granularity scenes; a narrative outline / numpy visual affinity produces coarser
   scenes and fewer calls). Evidence yield: 181 action entries + 56 on-screen-text entries, every
   scene covered 100 %.
+
+## 13. v0.5.1 — OP/ED Filtering + AV-Pass Hardening (external-review driven)
+
+- **Trigger**: an independent review of v0.5.0 against NarratoAI and Qwen-MM-Plugins found the
+  skeleton sound but the implementation fidelity soft — every claim was reproduced locally before
+  being accepted. Plus a user request: OP/ED content is simply not wanted.
+- **OP/ED filtering** (`scripts/op_ed.py`, config-driven): `materials/bible.json → op_ed_windows`
+  (measured once per series). Subtitle lines inside a window are dropped AT EXTRACTION (survivors
+  reindexed 1..N so the [[SUB:n]] contract stays contiguous; `op_ed_filtered` metadata records what
+  was removed), speech turns inside a window are dropped before clustering (the singer never
+  reaches characters_manifest), AV prepare skips window segments (2-3 fewer calls per episode),
+  and build_scene_manifest marks window scenes `op_ed` with a self-written one-line stub — the
+  final screenplay says （动画 OP）/（动画 ED） and nothing else. Strictly-greater-than-50% overlap
+  keeps boundary-straddling dialogue on the narrative side. No config = old behaviour everywhere.
+- **AV-pass hardening** (the review's P1-P3):
+  - plan_segments: the 45 s tail fold let segments balloon to 134 s against three documents
+    promising ≤90 s — fold is now capped at +10 s (91 s scene = one segment; 200 s = 90/90/20);
+  - coverage now measures evidence, not cuts: an empty {'raw': {}} note used to pass the resume
+    gate forever and keep scenes at a fictional 100% — substance gate + per-segment counts make
+    the SKILL's fallback path actually reachable;
+  - parse_note accepts key aliases (start_time/description/…) and MM:SS/HH:MM:SS strings; entries
+    outside the declared timebase are dropped AND counted instead of clamped into confident wrong
+    timecodes;
+  - the "JSON-repair round" was removed (it re-billed the video and never showed the model its own
+    reply — extract_json_payload's raw_decode salvage is the real repair); a truncation now fails
+    fast with the CORRECT remedy flag (--segment-seconds for video, --chunk-seconds for audio);
+  - fit_video cleans its busted ladder tiers (the same orphan bug v0.4.3 fixed in fit_audio);
+  - merge prints a 7-field summary instead of spraying the whole document to stdout, aggregates
+    token usage, deduplicates overlap-zone entries across segments (official _deduplicate_events
+    semantics), and WARNs when visible_text verbatim-duplicates subtitles (hard-sub sources).
+- **Tests**: +16 (window config/thresholds/reindex, plan cap + fold exception, alias/time-string
+  parsing, substance gate, dedup, part shape, no-rebill, real-ffmpeg fit ladder + orphan cleanup,
+  and a no-network prepare→cut→merge E2E leg) — **189 green**.

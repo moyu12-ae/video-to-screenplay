@@ -331,8 +331,8 @@ def _map_http_error(e: urllib.error.HTTPError) -> OmniError:
     return OmniError(kind, status=code, detail="upstream rejected the request")
 
 
-def _post_stream(url: str, api_key: str, body: Dict[str, Any],
-                 timeout_sec: float) -> Tuple[str, Optional[Dict[str, Any]]]:
+def _post_stream(url: str, api_key: str, body: Dict[str, Any], timeout_sec: float,
+                 length_hint: str = "re-prepare with a shorter --chunk-seconds") -> Tuple[str, Optional[Dict[str, Any]]]:
     host = urllib.parse.urlsplit(url).hostname or ""
     req = urllib.request.Request(
         url, data=json.dumps(body, ensure_ascii=False).encode("utf-8"), method="POST",
@@ -375,10 +375,11 @@ def _post_stream(url: str, api_key: str, body: Dict[str, Any],
         raise OmniError("empty", detail=f"host {host}")
     if finish == "length":
         # max_tokens ran out mid-reply. Retrying would reproduce the same cut, and
-        # accepting it would drop the tail of the part's speakers unnoticed.
+        # accepting it would drop the tail of the part's speakers unnoticed. The
+        # remedy flag differs per caller (audio parts: --chunk-seconds; video
+        # scenes: --segment-seconds), so it is threaded in.
         raise OmniError("bad_request",
-                        detail=f"completion truncated by max_tokens on host {host}; "
-                               "re-prepare with a shorter --chunk-seconds")
+                        detail=f"completion truncated by max_tokens on host {host}; {length_hint}")
     return text, usage
 
 
@@ -386,7 +387,9 @@ def call_omni_chat(messages: List[Dict[str, Any]], *, api_key: Optional[str] = N
                    base_url: Optional[str] = None, model: Optional[str] = None,
                    max_tokens: int = MAX_TOKENS, temperature: float = TEMPERATURE,
                    timeout_sec: Optional[float] = None, attempts: Optional[int] = None,
-                   log: Any = None) -> Tuple[str, Optional[Dict[str, Any]]]:
+                   log: Any = None,
+                   length_hint: str = "re-prepare with a shorter --chunk-seconds"
+                   ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """POST one streaming chat completion and return (text, usage).
 
     Transient failures - timeout, connection, 408/429/5xx, empty completion -
@@ -418,7 +421,7 @@ def call_omni_chat(messages: List[Dict[str, Any]], *, api_key: Optional[str] = N
             _log(log, f"[RETRY] attempt {attempt + 1}/{n} in {delay:.1f}s (previous: {last})")
             time.sleep(delay)
         try:
-            return _post_stream(url, key, body, to)
+            return _post_stream(url, key, body, to, length_hint)
         except OmniError as e:
             if not e.transient:
                 raise
@@ -478,7 +481,9 @@ def fit_video(video_path: str, budget: int = INLINE_RAW_BUDGET_BYTES) -> Tuple[P
             if size <= budget:
                 return out, "mp4"
             last_err = f"{height}p/crf{crf} still {size} bytes over budget"
+            out.unlink(missing_ok=True)   # a busted tier must not linger beside the source
         else:
+            out.unlink(missing_ok=True)   # drop the partial encode too
             lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
             last_err = lines[-1] if lines else "unknown ffmpeg error"
     raise ValueError(f"video segment cannot fit the inline budget: {last_err}")
@@ -508,9 +513,12 @@ def understand_video_segment(video_path: str, *, prompt: str, api_key: Optional[
                              max_tokens: int = 8192, temperature: float = 0.1,
                              timeout_sec: Optional[float] = None, attempts: Optional[int] = None,
                              log: Any = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """One video segment in, parsed evidence JSON out (one repair round when the
-    reply is not valid JSON). Returns (data, meta); meta carries provenance the
-    caller may keep or drop."""
+    """One video segment in, parsed evidence JSON out. An unparseable reply
+    raises instead of re-billing the video for a second attempt - extract_json_payload
+    already salvages a complete leading JSON value, so a second model round-trip
+    bought nothing (the official video2note stance: never spend another request
+    repairing JSON). Returns (data, meta); meta carries provenance the caller may
+    keep or drop."""
     src = Path(video_path)
     if not src.is_file():
         raise OmniError("bad_request", detail=f"video segment not found: {src.name}")
@@ -521,17 +529,9 @@ def understand_video_segment(video_path: str, *, prompt: str, api_key: Optional[
             {"type": "text", "text": prompt}]}]
         text, usage = call_omni_chat(messages, api_key=api_key, base_url=base_url, model=model,
                                      max_tokens=max_tokens, temperature=temperature,
-                                     timeout_sec=timeout_sec, attempts=attempts, log=log)
-        try:
-            data = extract_json_payload(text)
-        except ValueError:
-            repair_messages = messages + [{"role": "user", "content":
-                                           "Your previous reply was not valid JSON. "
-                                           "Output ONLY the JSON object, nothing else."}]
-            text, usage = call_omni_chat(repair_messages, api_key=api_key, base_url=base_url,
-                                         model=model, max_tokens=max_tokens, temperature=0.0,
-                                         timeout_sec=timeout_sec, attempts=attempts, log=log)
-            data = extract_json_payload(text)  # still bad -> ValueError to the caller
+                                     timeout_sec=timeout_sec, attempts=attempts, log=log,
+                                     length_hint="re-cut the scene with a smaller --segment-seconds")
+        data = extract_json_payload(text)  # ValueError -> the segment fails; `run` retries it
         meta = {
             "backend": "direct_api",
             "model": model or resolve_model(),

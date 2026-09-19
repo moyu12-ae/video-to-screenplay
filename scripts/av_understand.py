@@ -34,10 +34,12 @@ import json
 import os
 import subprocess
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import omni_client
+import op_ed
 from speaker_diarize import (
     EXIT_BAD_INPUT,
     EXIT_EXTRACT_FAILED,
@@ -45,13 +47,18 @@ from speaker_diarize import (
     EXIT_MISSING_KEY,
     EXIT_OK,
     EXIT_OMNI_OUTPUT_INVALID,
+    _norm_text,
+    load_subtitle_items,
     locate_video,
     require_binaries,
 )
 
 AV_SEGMENT_SEC = 90.0          # max seconds per segment (video2note's quality tier)
 AV_OVERLAP_SEC = 5.0           # between segments of the SAME scene only
-AV_NOTES_SCHEMA = "vts-av-notes/v1"
+AV_FOLD_TAIL_SEC = 10.0        # a tail shorter than this folds into the last window,
+                               # which may then run up to segment_sec + AV_FOLD_TAIL_SEC -
+                               # otherwise a 5 s sliver would cost a full API call
+AV_NOTES_SCHEMA = "vts-av-notes/v2"
 
 AV_UNDERSTAND_PROMPT = """You are a rigorous, objective audio-visual analyst for a screenplay
 reconstruction pipeline. Watch this clip and report ONLY what is truly visible and audible.
@@ -98,10 +105,13 @@ def build_prompt(start_ms: int, end_ms: int) -> str:
 
 def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_SEC,
                   overlap_sec: float = AV_OVERLAP_SEC) -> List[Dict[str, Any]]:
-    """Split each scene into <=segment_sec windows with overlap_sec shared between
-    consecutive windows of the SAME scene; a short tail folds back into the last
-    window instead of spawning a sliver. Pure; deterministic. Segments never
-    cross scene boundaries."""
+    """Split each scene into windows of at most segment_sec seconds, with
+    overlap_sec shared between consecutive windows of the SAME scene. A tail
+    shorter than AV_FOLD_TAIL_SEC folds into the last window instead of
+    spawning a sliver that would cost a full API call - that one window may
+    then run up to segment_sec + AV_FOLD_TAIL_SEC (documented exception;
+    200 s -> [90, 90, 20] with the old 45 s fold was the bug). Segments never
+    cross scene boundaries. Pure; deterministic."""
     segments: List[Dict[str, Any]] = []
     ov = int(overlap_sec * 1000)
     max_len = int(segment_sec * 1000)
@@ -113,7 +123,7 @@ def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_
         start = s0
         while start < s1:
             end = min(s1, start + max_len)
-            if s1 - end < max_len // 2:      # short tail folds into this window
+            if s1 - end < int(AV_FOLD_TAIL_SEC * 1000):      # sliver merges into this window
                 end = s1
             segments.append({"scene_id": sid, "start_ms": start, "end_ms": end})
             if end >= s1:
@@ -124,61 +134,161 @@ def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_
     return segments
 
 
+def _parse_sec(value: Any, span_s: float) -> Optional[float]:
+    """Seconds from a number, or from 'SS', 'SS.s', 'MM:SS(.f)', 'HH:MM:SS(.f)'
+    strings (models drift between timebases). Returns None for anything
+    unparseable or OUTSIDE the declared local timebase [0, span] - an
+    out-of-window timestamp is a wrong-but-confident timecode in the making,
+    so it is dropped and counted, never clamped."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+    elif isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            parts = [float(p) for p in s.split(":")]
+        except ValueError:
+            return None
+        if len(parts) > 3:
+            return None
+        f = 0.0
+        for part in parts:
+            f = f * 60.0 + part
+    else:
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    if f < 0.0 or f > span_s + 0.5:
+        return None
+    return f
+
+
+def _first(entry: Dict[str, Any], names: Tuple[str, ...]) -> Any:
+    for n in names:
+        if n in entry and entry[n] is not None:
+            return entry[n]
+    return None
+
+
 def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
     """Coerce one model reply into the note schema and shift LOCAL-relative
-    seconds onto the absolute episode timeline (ms). Malformed entries are
-    dropped; missing keys become empty defaults. Never raises."""
+    seconds onto the absolute episode timeline (ms). Key aliases are accepted
+    (models drift between start/start_time, what/description); malformed or
+    out-of-timebase entries are DROPPED AND COUNTED in note["dropped"] - never
+    silently clamped into confident wrong timecodes. Never raises on bad data."""
     span_s = max(0.001, (end_ms - start_ms) / 1000.0)
+    dropped: Dict[str, int] = {"actions": 0, "camera": 0, "visible_text": 0, "acoustic_events": 0}
 
-    def sec(v: Any) -> Optional[float]:
-        try:
-            f = float(v)
-        except (TypeError, ValueError):
-            return None
-        if f != f or f in (float("inf"), float("-inf")):   # NaN / inf guard
-            return None
-        return min(max(f, 0.0), span_s)
-
-    def shift(entries: Any, keys: Tuple[str, ...] = ("start", "end")) -> List[Dict[str, Any]]:
+    def timed(entries: Any, who_names: Tuple[str, ...], what_names: Tuple[str, ...],
+              channel: str) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
-        if not isinstance(entries, list):
-            return out
-        for e in entries:
+        for e in (entries if isinstance(entries, list) else []):
             if not isinstance(e, dict):
+                dropped[channel] += 1
                 continue
-            row = {k: v for k, v in e.items() if k not in keys}
-            s = sec(e.get(keys[0]))
-            if s is None:
+            s = _parse_sec(_first(e, ("start", "start_time", "start_sec", "from")), span_s)
+            end_v = _first(e, ("end", "end_time", "end_sec", "to"))
+            t = _parse_sec(end_v, span_s) if end_v is not None else s
+            what = _first(e, what_names)
+            if s is None or t is None or t < s or what is None:
+                dropped[channel] += 1
                 continue
-            # point events (sound cues) carry only "start"; an explicit inverted
-            # window stays malformed and is dropped
-            t = sec(e.get(keys[1])) if keys[1] in e else s
-            if t is None or t < s:
-                continue
-            row[keys[0]] = start_ms + int(s * 1000)
-            row[keys[1]] = start_ms + int(t * 1000)
+            row: Dict[str, Any] = {"start": start_ms + int(round(s * 1000)),
+                                   "end": start_ms + int(round(t * 1000))}
+            who = _first(e, who_names)
+            if who is not None:
+                row["who"] = str(who)
+            row["what"] = str(what)
             out.append(row)
         return out
 
     data = data if isinstance(data, dict) else {}
     visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
     acoustic = data.get("acoustic") if isinstance(data.get("acoustic"), dict) else {}
+    visible_text = []
+    for e in (data.get("visible_text") if isinstance(data.get("visible_text"), list) else []):
+        if not isinstance(e, dict):
+            dropped["visible_text"] += 1
+            continue
+        s = _parse_sec(_first(e, ("start", "start_time", "start_sec")), span_s)
+        end_v = _first(e, ("end", "end_time", "end_sec"))
+        t = _parse_sec(end_v, span_s) if end_v is not None else s
+        text = _first(e, ("text", "content"))
+        if s is None or t is None or t < s or text is None:
+            dropped["visible_text"] += 1
+            continue
+        row = {"start": start_ms + int(round(s * 1000)), "end": start_ms + int(round(t * 1000)),
+               "text": str(text)}
+        appearance = _first(e, ("appearance", "style", "look"))
+        if appearance is not None:
+            row["appearance"] = str(appearance)
+        visible_text.append(row)
+
     return {
         "visual": {
             "caption": str(visual.get("caption") or ""),
-            "actions": shift(visual.get("actions")),
-            "camera": shift(visual.get("camera")),
+            "actions": timed(visual.get("actions"), ("who", "epithet", "character", "person"),
+                             ("what", "description", "action", "content"), "actions"),
+            "camera": timed(visual.get("camera"), (), ("movement", "camera", "shot"), "camera"),
             "scene_transition": str(visual.get("scene_transition") or ""),
         },
-        "visible_text": shift(data.get("visible_text"), ("start", "end")),
+        "visible_text": visible_text,
         "acoustic": {
-            "events": shift(acoustic.get("events"), ("start", "end")),
+            "events": timed(acoustic.get("events"), (), ("what", "event", "sound", "description"),
+                            "acoustic_events"),
             "music_mood": str(acoustic.get("music_mood") or ""),
         },
         "uncertain": [str(u).strip() for u in data.get("uncertain", [])
                       if isinstance(u, str) and u.strip()]
         if isinstance(data.get("uncertain"), list) else [],
+        "dropped": dropped,
     }
+
+
+def has_substance(note: Dict[str, Any]) -> bool:
+    """True when a parsed note carries at least one usable evidence entry - an
+    empty {'raw': {}} reply used to pass the resume gate and keep a scene at a
+    fictional 100% coverage."""
+    v = note.get("visual") if isinstance(note.get("visual"), dict) else {}
+    ac = note.get("acoustic") if isinstance(note.get("acoustic"), dict) else {}
+    return bool(str(v.get("caption") or "").strip()
+                or v.get("actions") or v.get("camera")
+                or note.get("visible_text") or ac.get("events")
+                or str(ac.get("music_mood") or "").strip()
+                or note.get("uncertain"))
+
+
+def dedup_entries(entries: List[Dict[str, Any]], previous: List[Dict[str, Any]],
+                  text_key: str = "what", ratio: float = 0.86,
+                  time_gap_ms: int = 1500) -> List[Dict[str, Any]]:
+    """Overlap-zone deduplication across segment boundaries - the official
+    _deduplicate_events idea: an entry is dropped when a previously kept one
+    matches on normalized text (SequenceMatcher >= ratio) AND the two windows
+    overlap or start within time_gap_ms; the earlier entry's span is extended
+    to cover the duplicate. Pure; preserves order."""
+    pool = list(previous)
+    out: List[Dict[str, Any]] = []
+    for e in entries:
+        sig = _norm_text(f"{e.get('who') or ''} {e.get(text_key) or ''}")
+        dup: Optional[Dict[str, Any]] = None
+        if sig:
+            for p in pool:
+                psig = _norm_text(f"{p.get('who') or ''} {p.get(text_key) or ''}")
+                if not psig or SequenceMatcher(None, sig, psig).ratio() < ratio:
+                    continue
+                overlap = min(e["end"], p["end"]) - max(e["start"], p["start"])
+                if overlap > 0 or abs(e["start"] - p["start"]) <= time_gap_ms:
+                    dup = p
+                    break
+        if dup is not None:
+            dup["end"] = max(dup["end"], e["end"])
+            continue
+        out.append(e)
+        pool.append(e)
+    return out
 
 
 def scene_coverage(scene: Dict[str, Any], intervals: List[Tuple[int, int]]) -> Tuple[float, int]:
@@ -257,6 +367,21 @@ def cmd_prepare(ws: Optional[str], segment_sec: float, video_override: Optional[
     scenes = load_scenes(ws)
     segments = plan_segments(scenes, segment_sec)
 
+    # OP/ED windows (v0.5.1): segments inside a configured window are skipped -
+    # watching the opening credits produces staff-list evidence nobody weaves in.
+    op_ed_windows = op_ed.load_windows(ws)
+    kept_segments: List[Dict[str, Any]] = []
+    skipped_op_ed: List[Dict[str, Any]] = []
+    for seg in segments:
+        label = op_ed.matching_label(seg["start_ms"], seg["end_ms"], op_ed_windows)
+        if label:
+            skipped_op_ed.append({**seg, "label": label})
+            sys.stderr.write(f"[SKIP] {seg['scene_id']} {seg['start_ms'] / 1000.0:.1f}-"
+                             f"{seg['end_ms'] / 1000.0:.1f}s: inside configured {label} window\n")
+        else:
+            kept_segments.append(seg)
+    segments = kept_segments
+
     av_dir = Path(ws, ".cache", "av") if ws else Path(".cache", "av")
     os.makedirs(av_dir, exist_ok=True)
     entries: List[Dict[str, Any]] = []
@@ -285,6 +410,8 @@ def cmd_prepare(ws: Optional[str], segment_sec: float, video_override: Optional[
         "expected_schema": {"visual": ["caption", "actions", "camera", "scene_transition"],
                             "visible_text": [], "acoustic": ["events", "music_mood"],
                             "uncertain": []},
+        "op_ed_windows": op_ed_windows,
+        "skipped_op_ed": skipped_op_ed,
         "scenes": [{"scene_id": s["scene_id"], "start_ms": s.get("start_ms", 0),
                     "end_ms": s.get("end_ms", 0)} for s in scenes],
         "segments": entries,
@@ -326,12 +453,15 @@ def _workorder(ws: Optional[str]) -> Tuple[Path, Dict[str, Any]]:
 
 
 def _is_valid_note(pth: Path) -> bool:
+    """A saved note is resume-valid only when it parses AND carries actual
+    evidence substance - {'raw': {}} used to count as done forever, keeping a
+    scene at a fictional 100% coverage."""
     try:
-        data = json.loads(pth.read_text(encoding="utf-8"))
+        loaded = json.loads(pth.read_text(encoding="utf-8"))
     except Exception:
         return False
-    return isinstance(data, dict) and (isinstance(data.get("raw"), dict)
-                                       or isinstance(data.get("visual"), dict))
+    raw = loaded.get("raw") if isinstance(loaded, dict) and isinstance(loaded.get("raw"), dict) else loaded
+    return isinstance(raw, dict) and has_substance(parse_note(raw, 0, 1000))
 
 
 def cmd_run(ws: Optional[str], force: bool = False) -> None:
@@ -387,8 +517,10 @@ def cmd_run(ws: Optional[str], force: bool = False) -> None:
             o_p.write_text(json.dumps({"raw": data, "meta": meta},
                                       ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             probe = parse_note(data, int(entry["start_ms"]), int(entry["end_ms"]))
+            dropped_note = sum(probe["dropped"].values())
             sys.stderr.write(f"[OK  ] seg_{i:03d}: {len(probe['visual']['actions'])} actions, "
-                             f"{len(probe['visible_text'])} on-screen text -> {o_p.name}\n")
+                             f"{len(probe['visible_text'])} on-screen text -> {o_p.name}"
+                             + (f" ({dropped_note} malformed dropped)" if dropped_note else "") + "\n")
         except omni_client.OmniError as e:
             sys.stderr.write(f"[ERROR] seg_{i:03d}: {e}\n")
             failed.append(f"seg_{i:03d} {e.kind}")
@@ -413,6 +545,7 @@ def cmd_merge(ws: Optional[str]) -> None:
     av_dir, work = _workorder(ws)
     scenes = {str(s["scene_id"]): s for s in work.get("scenes", []) if isinstance(s, dict)}
     scene_segments: Dict[str, List[Dict[str, Any]]] = {}
+    total_tokens = 0
     for i, entry in enumerate(work.get("segments", [])):
         p = (av_dir / os.path.basename(entry["output"])).resolve()
         if ws:
@@ -429,34 +562,72 @@ def cmd_merge(ws: Optional[str]) -> None:
         except Exception as e:
             sys.stderr.write(f"[FATAL] AV note {p.name} is not valid JSON: {e}\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
-        raw = loaded.get("raw") if isinstance(loaded, dict) else None
-        if raw is None:  # tolerate a pre-parsed note (single-shift assumption broken; prefer raw)
-            raw = loaded if isinstance(loaded, dict) and "visual" in loaded else None
+        raw = loaded.get("raw") if isinstance(loaded, dict) and isinstance(loaded.get("raw"), dict) else None
+        if raw is None and isinstance(loaded, dict) and "visual" in loaded:
+            raw = loaded  # tolerate a pre-parsed note
         if not isinstance(raw, dict):
             sys.stderr.write(f"[FATAL] AV note {p.name} has no usable payload\n")
             sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+        meta = loaded.get("meta") if isinstance(loaded, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("usage"), dict):
+            total_tokens += int(meta["usage"].get("total_tokens") or 0)
         note = parse_note(raw, int(entry["start_ms"]), int(entry["end_ms"]))
-        sid = str(entry.get("scene_id", ""))
-        scene_segments.setdefault(sid, []).append({
+        if sum(note["dropped"].values()):
+            sys.stderr.write(f"[WARN] seg_{i:03d}: dropped {sum(note['dropped'].values())} malformed "
+                             f"evidence entr(y/ies) {note['dropped']}\n")
+        scene_segments.setdefault(str(entry.get("scene_id", "")), []).append({
             "start_ms": int(entry["start_ms"]), "end_ms": int(entry["end_ms"]),
-            "visual": note["visual"], "visible_text": note["visible_text"],
-            "acoustic": note["acoustic"], "uncertain": note["uncertain"],
-        })
+            "substantive": has_substance(note), "note": note})
 
+    # Coverage counts only segments that actually RETURNED evidence - a cut
+    # window with an empty note is a paid-for span the writer did not get.
+    subtitle_norms = _load_subtitle_norms(ws)
+    dup_subtitles = 0
     scene_notes = []
+    totals = {"actions": 0, "visible_text": 0, "acoustic_events": 0}
     for sid, sc in scenes.items():
-        covered_pct, _ = scene_coverage(sc, [(seg["start_ms"], seg["end_ms"])
-                                             for seg in scene_segments.get(sid, [])])
+        segs = sorted(scene_segments.get(sid, []), key=lambda s: s["start_ms"])
+        covered_pct, _ = scene_coverage(sc, [(s["start_ms"], s["end_ms"])
+                                             for s in segs if s["substantive"]])
         if covered_pct < 100.0:
             sys.stderr.write(f"[WARN] Scene {sid} coverage {covered_pct}% - gaps fall back to "
                              "keyframes-only evidence for the writer\n")
+        prev: Dict[str, List[Dict[str, Any]]] = {"actions": [], "camera": [],
+                                                 "visible_text": [], "acoustic_events": []}
+        out_segs = []
+        for s in segs:
+            note = s["note"]
+            acts = dedup_entries(note["visual"]["actions"], prev["actions"], "what")
+            cams = dedup_entries(note["visual"]["camera"], prev["camera"], "movement")
+            vts = dedup_entries(note["visible_text"], prev["visible_text"], "text")
+            evs = dedup_entries(note["acoustic"]["events"], prev["acoustic_events"], "what")
+            for v in vts:
+                norm = _norm_text(v.get("text", ""))
+                if norm and norm in subtitle_norms:
+                    dup_subtitles += 1
+            prev["actions"].extend(acts)
+            prev["camera"].extend(cams)
+            prev["visible_text"].extend(vts)
+            prev["acoustic_events"].extend(evs)
+            totals["actions"] += len(acts)
+            totals["visible_text"] += len(vts)
+            totals["acoustic_events"] += len(evs)
+            out_segs.append({
+                "start_ms": s["start_ms"], "end_ms": s["end_ms"], "substantive": s["substantive"],
+                "visual": {**note["visual"], "actions": acts, "camera": cams},
+                "visible_text": vts,
+                "acoustic": {**note["acoustic"], "events": evs},
+                "uncertain": note["uncertain"], "dropped": note["dropped"]})
         scene_notes.append({
             "scene_id": sid,
             "start_ms": int(sc.get("start_ms", 0)),
             "end_ms": int(sc.get("end_ms", 0)),
             "covered_pct": covered_pct,
-            "segments": sorted(scene_segments.get(sid, []), key=lambda s: s["start_ms"]),
-        })
+            "segments": out_segs})
+    if dup_subtitles:
+        sys.stderr.write(f"[WARN] {dup_subtitles} visible-text entr(y/ies) duplicate subtitle dialogue "
+                         "verbatim - on hard-subbed sources visible_text IS the dialogue; the writer "
+                         "must treat them as evidence only, never as [[SUB:n]] material\n")
 
     payload = json.dumps({
         "schema": AV_NOTES_SCHEMA,
@@ -471,7 +642,35 @@ def cmd_merge(ws: Optional[str]) -> None:
             sys.stderr.write(f"[FATAL] AV notes path escaped the workspace containment: {notes_path}\n")
             sys.exit(2)
     notes_path.write_text(payload, encoding="utf-8")
-    sys.stdout.write(payload)
+    # Context hygiene (the manifest-builder convention): the full document lives
+    # ON DISK; stdout carries only the summary an agent needs.
+    covs = [s["covered_pct"] for s in scene_notes] or [0.0]
+    summary = {
+        "schema": AV_NOTES_SCHEMA,
+        "scenes": len(scene_notes),
+        "covered_min": min(covs),
+        "covered_avg": round(sum(covs) / len(covs), 1),
+        "evidence": totals,
+        "tokens": total_tokens,
+        "notes_path": str(notes_path),
+    }
+    sys.stdout.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
+
+
+def _load_subtitle_norms(ws: Optional[str]) -> set:
+    """Normalized subtitle texts for the visible-text duplication WARN (a
+    hard-subbed source makes visible_text echo the dialogue)."""
+    try:
+        path = (Path(ws, ".cache", "subtitles", "extracted.json") if ws
+                else Path(".cache", "subtitles", "extracted.json"))
+        if not path.is_file():
+            return set()
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        items = doc.get("items") if isinstance(doc, dict) else doc
+        return {_norm_text(str(it.get("text", ""))) for it in (items or [])
+                if isinstance(it, dict)} - {""}
+    except Exception:  # noqa: BLE001 - the gate is advisory
+        return set()
 
 
 def main() -> None:

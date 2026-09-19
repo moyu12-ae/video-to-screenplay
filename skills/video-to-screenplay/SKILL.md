@@ -81,6 +81,12 @@ python3 scripts/workspace.py doctor
 ```
 
 - 🔑 **API key 前置检查**：`doctor` 报告 `diarization.dashscope_api_key`（只含 `"set"`/`"missing"`，绝不含 key 值）。为 `missing` 时**必须**用 `AskUserQuestion` 让用户三选一：① 现在配置 `DASHSCOPE_API_KEY` 后重跑检查；② 明确选择"无声学归属继续"（说话人列留空；阶段 2 仍可走 MCP 回退路径 B）；③ 中止流水线。**绝不静默降级**。
+- 🎬 **OP/ED 窗口（可选，推荐）**：用户不想要 OP/ED 内容时，在 `materials/bible.json` 配置一次、全季通用：
+  ```json
+  {"op_ed_windows": [{"start_ms": 84000, "end_ms": 105000, "label": "OP"},
+                     {"start_ms": 1320000, "end_ms": 1440000, "label": "ED"}]}
+  ```
+  配置后：字幕行在提取时即被过滤（`extracted.json` 记录 `op_ed_filtered` 明细，存活行重编号保持 [[SUB:n]] 连续）、声学分离丢弃窗口内语音段（歌手不再混入角色表）、声画理解跳过窗口内场景（每集省 2-3 次调用）、manifest 把窗口内场景标为 `op_ed` 并写好单行 stub——成稿在相应位置只出现一行 **（动画 OP）/（动画 ED）**。不配置 = 行为与旧版完全一致。
 
 probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随后通过 `AskUserQuestion` 询问用户：
 - **外挂字幕**（一级）：在 `materials/` 中检出 `.srt`/`.ass`。
@@ -156,7 +162,7 @@ python3 scripts/av_understand.py --workspace "<ws>" prepare   # 切段 + 转码�
 python3 scripts/av_understand.py --workspace "<ws>" run       # 直连逐段理解 + merge，缺 key exit 8
 ```
 
-- **prepare**：读 scenes.json，>90 秒的场景切成 ≤90 秒段（`--segment-seconds` 可调；段间 5 秒重叠、短尾折叠、段不跨场景），逐段转码 480p/CRF 阶梯 MP4（超 inline 预算自动降档），写 `av_workorder.json`。**启用前用 AskUserQuestion 预告成本**（实测校准，ep5 10 分钟片/35 段：每段 ~38 秒墙钟、~5.4k tokens，合计 ~3.2× 片长墙钟、~190k tokens——段数 = 工作单 segments 数；**后台执行**），经用户确认再执行。
+- **prepare**：读 scenes.json，>90 秒的场景切成 ≤90 秒段（`--segment-seconds` 可调；段间 5 秒重叠、段不跨场景；**短尾折叠例外至 +10 秒**——91 秒的场景仍是 1 段，避免为 1 秒碎尾多付一次调用），逐段转码 480p/CRF 阶梯 MP4（超 inline 预算自动降档），写 `av_workorder.json`；配置了 OP/ED 窗口时自动跳过窗口内的段（记录在 `skipped_op_ed`）。**启用前用 AskUserQuestion 预告成本**（实测校准，ep5 10 分钟片/35 段：每段 ~38 秒墙钟、~5.4k tokens，合计 ~3.2× 片长墙钟、~190k tokens——段数 = 工作单 segments 数；**后台执行**），经用户确认再执行。
 - **run**：逐段直连 DashScope。模型只产出四通道结构化证据——`visual.actions`（谁做了什么）、`visual.camera`（景别/运镜）、`visible_text`（屏显文字逐字+起止）、`acoustic`（音效事件+音乐情绪）——prompt 里**明令不做台词转写、不给人物起名**（人物一律描述性称呼如"红衣女子"，命名权归场景写作 pass）；不确定之处进 `uncertain`。逐段断点续跑、单片失败不阻塞（`--force` 全部重做）。
 - **merge（run 内置）**：段内相对秒 +start 映射回源时间轴 → 按场景聚合 → **覆盖率校验**（<100% 的场景 WARN，缺口区间由写作者回退关键帧证据）→ `.cache/visual/av_notes.json`。
 - 🔴 **红线**：av_notes 是**证据层**——绝不成为台词文本（台词永远 `[[SUB:n]]` 逐字来自字幕）、绝不改判声学归属、绝不替代关键帧。
@@ -190,7 +196,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 - 场头规范化：每场 H2 统一为 `## 场 N【标题】（起 - 止）`——标题保留写作阶段起的名字，时间码从 scene_manifest 确定性注入；遗留的 `> 概要：` 引用行会被剥离。
 - 校验覆盖：缺失、重复、错位或孤儿的占位符都是**致命**错误，并点名出错的下标；说话人名单 lint 对 bible/manifest/通用角色词之外的名字告警。制作专属的描述性称呼（如「面试的店主」）写进 `materials/bible.json` 的 `"speaker_whitelist": [...]` 数组即可消除告警——插件内置白名单只含通用角色词，绝不烧入单部作品的词汇。
 - 组装整集文档：元数据头（字幕来源、镜头/场景计数）、场次总表、拼装后的各场、附录（声画关系统计 + 保真报告）。
-- 输出：`output/<标题>_影视文学剧本.md`。
+- 输出：`output/<标题>_影视文学剧本.md`。配置了 OP/ED 窗口时，成稿在相应位置只含一行 **（动画 OP）/（动画 ED）** 标注，保真报告记录被过滤的行数与窗口明细。
 - 🛑 **停下复查**：splice 退出码 0 且 `dialogue_spliced == dialogue_total`；确认所有 lint 告警已知晓；交付物在 `output/`，项目根目录无散落文件，最终 `.md` 中零 `SPEAKER_` 字符串。
 
 ---
@@ -212,6 +218,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
 | 内嵌轨疑似纯字幕牌（SIGN/Forced） | extracted.json 的 `embedded_stream.reason=last_resort_all_look_like_signs`，或行文本多为画面文字 | 用 `--lang` 指定其他语言轨重抽；多轨源可显式映射对白轨重剪（`ffmpeg -map 0:<idx>`） |
+| 片源有 OP/ED 但成稿出现歌词"场景"或歌手簇 | 未配置 `op_ed_windows` | 在 bible.json 配置窗口后重跑——字幕过滤/声学丢弃/av 跳过/单行标注全链路自动生效 |
 | 声画理解无 key / 用户选择跳过 | av run **退出码 8** / AskUserQuestion 选跳过 | 阶段 4 退回纯关键帧证据，流水线其余不受影响 |
 | 声画理解单段调用失败 | av run 逐段 `[ERROR]` 不阻塞其余 | 重跑 `run`（断点续跑只补缺）；或放弃该 pass |
 | 场景声画覆盖缺口 | av_notes.json 中该场景 `covered_pct<100` + merge WARN | 缺口区间回退关键帧证据；必要时 `--segment-seconds` 调小重切 `prepare` |
