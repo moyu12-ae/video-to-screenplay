@@ -4,6 +4,16 @@ English | [简体中文](README_CN.md)
 
 A ZCode plugin that reverse-engineers videos and anime episodes into production-standard Asian 场号制 screenplays. Deterministic Python stages compute everything measurable (cuts, timecodes, dialogue alignment); perception is delegated to general multimodal models — scene understanding (place, time of day, characters, staging) is supplied by the agent itself, while speaker attribution comes from **Qwen3.8-Omni acoustic timbre clustering** (dialed directly from the pipeline via `speaker_diarize.py run`, with the MCP tool `omni_multi_speaker_asr` as a fallback, and degrading gracefully to fully-unattributed when unconfigured). Dialogue text always comes exclusively from subtitles via `[[SUB:n]]` verbatim splicing — acoustics and OCR never touch the dialogue text itself.
 
+## ⚠️ Aliyun API Key Required
+
+**Configure an Aliyun DashScope API key before using this plugin.**
+
+1. Create one in the [Aliyun Bailian console](https://bailian.console.aliyun.com/) (API-KEY management).
+2. Export it: `export DASHSCOPE_API_KEY="sk-..."`
+3. Optional — point to another OpenAI-compatible endpoint: `export DASHSCOPE_BASE_URL="https://..."`
+
+The key powers Qwen3.8-Omni acoustic speaker diarization. Stage 1 preflight-checks it: when it is missing, the pipeline asks you explicitly — configure the key, or consciously continue with blank speaker columns (`speaker_diarize.py run` exits 8 as a second guard).
+
 ## How It Works
 
 1. **Clean Workspace** — `materials/` (read-only inputs) → `.cache/` (disposable intermediates) → `output/` (final screenplay only).

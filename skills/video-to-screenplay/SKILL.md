@@ -1,6 +1,6 @@
 ---
 name: video-to-screenplay
-description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
+description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门与 API key 前置检查门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
 ---
 
 # 视频转剧本流水线（`video-to-screenplay`）
@@ -41,7 +41,7 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
 
 ```
 [materials/*]
-     │  阶段 1：工作区初始化 + 探测 + 字幕决策门（AskUserQuestion / 快速失败退出码 5）
+     │  阶段 1：工作区初始化 + 探测 + API key 前置检查 + 字幕决策门（AskUserQuestion / 快速失败退出码 5）
      │
      ├─ 视觉轨：    scene_detect.py       → shots.json + keyframes/
      └─ 台词轨：    subtitle_extractor.py → extracted.json
@@ -65,12 +65,15 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
 
 ## 3. 执行阶段
 
-### 阶段 1 —— 工作区初始化与字幕决策门
+### 阶段 1 —— 工作区初始化、API key 前置检查与字幕决策门
 
 ```bash
 python3 scripts/workspace.py init  --workspace "<ws>"
 python3 scripts/workspace.py probe --workspace "<ws>"
+python3 scripts/workspace.py doctor
 ```
+
+- 🔑 **API key 前置检查**：`doctor` 报告 `diarization.dashscope_api_key`（只含 `"set"`/`"missing"`，绝不含 key 值）。为 `missing` 时**必须**用 `AskUserQuestion` 让用户三选一：① 现在配置 `DASHSCOPE_API_KEY` 后重跑检查；② 明确选择"无声学归属继续"（说话人列留空；阶段 2 仍可走 MCP 回退路径 B）；③ 中止流水线。**绝不静默降级**。
 
 probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随后通过 `AskUserQuestion` 询问用户：
 - **外挂字幕**（一级）：在 `materials/` 中检出 `.srt`/`.ass`。
@@ -174,6 +177,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 失败情形 | 信号 | 响应 |
 | :--- | :--- | :--- |
 | 完全没有字幕 | probe 为空 + 用户确认 | 硬性拒绝，退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
+| 阶段 1 未配置 DASHSCOPE_API_KEY | doctor 报告 `diarization.dashscope_api_key=missing` | AskUserQuestion 显式三选一（配 key 重跑 / 降级继续 / 中止）；选择降级后 `run` 仍会以退出码 8 二次拦截 |
 | 无 DASHSCOPE_API_KEY（路径 A 首次执行） | run **退出码 8** | 三选一：配 key 重跑 run；走路径 B 调 MCP；`merge --empty-fallback` 全 null 继续 |
 | 直连单片网络瞬态（超时/连接/429/5xx/空补全） | run 内已自动指数退避重试（`V2S_OMNI_ATTEMPTS` 默认 3） | 重试耗尽的分片报 ERROR 但不阻塞其余；处置后重跑 `run` 只补缺 |
 | 直连单调用近超时天花板（超长分片） | run 对 >25 分钟分片 WARN；调用死于超时 | `prepare --chunk-seconds 1200` 重切后重跑 `run` |

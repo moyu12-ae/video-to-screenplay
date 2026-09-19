@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,7 @@ from speaker_diarize import (
     snap_boundaries,
 )
 import omni_client
+import workspace
 from align_timeline import infer_av_relationship
 
 
@@ -593,6 +595,61 @@ class TestSpeakerDiarizeRun(unittest.TestCase):
         work = make_workorder("v.mkv", 60_000, [(0, 60_000)], None, None, no_audio=False)
         self.assertIn("`run`", work["note"])
         self.assertIn("omni_multi_speaker_asr", work["note"])
+
+
+class TestWorkspaceDoctor(unittest.TestCase):
+    """doctor's diarization preflight: presence-only key reporting (the key value
+    must never appear in the report). ffmpeg/ffprobe are faked for determinism."""
+
+    def _doctor(self, env, tools_ready=True):
+        out = io.StringIO()
+        which = (lambda name: f"/usr/bin/{name}") if tools_ready else (lambda name: None)
+        fake = subprocess.CompletedProcess([], 0, stdout="ffmpeg version 7.0\n", stderr="")
+        code = 0  # doctor returns normally on success; sys.exit(3) only when tools missing
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(workspace.shutil, "which", side_effect=which), \
+             mock.patch.object(workspace.subprocess, "run", return_value=fake), \
+             contextlib.redirect_stdout(out):
+            try:
+                workspace.run_doctor_check()
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def test_doctor_reports_key_set_and_never_leaks_value(self):
+        fake_key = "-".join(["test", "key", "12345"])  # assembled; never a real credential
+        code, out = self._doctor({"DASHSCOPE_API_KEY": fake_key})
+        self.assertEqual(code, 0)
+        report = json.loads(out)["report"]
+        self.assertEqual(report["diarization"]["dashscope_api_key"], "set")
+        self.assertTrue(report["diarization"]["ready"])
+        self.assertNotIn(fake_key, out)
+
+    def test_doctor_reports_key_missing(self):
+        code, out = self._doctor({"DASHSCOPE_API_KEY": ""})
+        self.assertEqual(code, 0)  # key absence is reported, not fatal, at doctor level
+        report = json.loads(out)["report"]
+        self.assertEqual(report["diarization"]["dashscope_api_key"], "missing")
+        self.assertFalse(report["diarization"]["ready"])
+
+    def test_doctor_reports_endpoint_host_and_model(self):
+        _, out = self._doctor({"DASHSCOPE_BASE_URL": "https://api.example.com/v1",
+                               "V2S_OMNI_MODEL": "test-model"})
+        report = json.loads(out)["report"]
+        self.assertEqual(report["diarization"]["dashscope_base_url_host"], "api.example.com")
+        self.assertEqual(report["diarization"]["model"], "test-model")
+
+    def test_doctor_default_endpoint_host(self):
+        _, out = self._doctor({})
+        report = json.loads(out)["report"]
+        self.assertEqual(report["diarization"]["dashscope_base_url_host"], "dashscope.aliyuncs.com")
+
+    def test_doctor_exit_3_when_ffmpeg_missing(self):
+        code, out = self._doctor({}, tools_ready=False)
+        self.assertEqual(code, 3)
+        report = json.loads(out)["report"]
+        self.assertFalse(report["ffmpeg"]["ready"])
+        self.assertFalse(report["ffprobe"]["ready"])
 
 
 if __name__ == "__main__":

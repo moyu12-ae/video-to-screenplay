@@ -138,3 +138,28 @@
 - **Latency model (measured)**: streaming ≠ realtime — the model ingests the whole part before
   the first token; a 24-min part ≈ 10–20 min wall clock. `run` warns on parts > 25 min
   (re-prepare with `--chunk-seconds 1200` in that case) and should run in the background.
+- **Live acceptance (2026-09-19)**: smoke (ep3 148 s clip, fresh workspace) prepare→run→merge in
+  50 s, 52 turns, provenance correct; full-episode acceptance — ep3 (24 min, 1440 s, 415 embedded
+  subtitle lines) as ONE part, ONE direct call, ~7 min wall clock (0.29× audio length), 521 turns /
+  10 voices, 95.9 % attributed, the 60-line regression window matches the 5-part MCP result
+  (57/60), audio auto-refit to MP3 (12 MB > 7.27 MB budget), ~45 k tokens/episode. Zero retries,
+  zero splits — the ~35-call fault surface of the MCP era is gone.
+
+## 9. v0.4.1 — API Key Preflight Gate & README Declaration
+
+- **Trigger (user feedback on v0.4.0)**: the key requirement was buried in Requirements and only
+  surfaced at runtime (exit 8) — too late. The plugin must DECLARE, up front, that an Aliyun
+  DashScope API key is required, and the pipeline must check it as a first-class gate.
+- **Decisions (user-confirmed)**: gate behavior = explicit ask with degradation allowed (never
+  silent); README wording = plugin-level ("configure an Aliyun API key before use"), with the
+  precise per-feature nuance kept as a footnote.
+- **Changes**: `workspace.py doctor` now performs a real diarization preflight (reusing
+  `omni_client` resolvers): `diarization.dashscope_api_key` reported as `set`/`missing` (the key
+  VALUE never enters reports/logs/files), endpoint host + model resolution, `ready` flag —
+  replacing the old hardcoded `diarization_engine` string (no programmatic consumers). SKILL.md
+  stage 1 invokes `doctor` and REQUIRES an AskUserQuestion (configure key / explicitly continue
+  with blank speakers / abort) when the key is missing; `run` exit 8 remains the second guard.
+  README×2 gain a prominent "⚠️ Aliyun API Key Required / 使用前必须配置阿里云 API Key" section
+  (Bailian console link, env exports, gate behavior); plugin.json descriptions mention the key.
+- **Tests**: first workspace.py coverage — `TestWorkspaceDoctor` (5 cases incl. a no-leak
+  assertion running doctor with a fake key).

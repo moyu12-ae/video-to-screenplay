@@ -4,6 +4,16 @@
 
 一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（由流水线自身直连 DashScope 完成——`speaker_diarize.py run`；MCP 工具 `omni_multi_speaker_asr` 作回退；未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
 
+## ⚠️ 使用前必须配置阿里云 API Key
+
+**使用本插件前，请先配置阿里云 DashScope API Key。**
+
+1. 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)的 API-KEY 管理页创建密钥；
+2. 导出环境变量：`export DASHSCOPE_API_KEY="sk-..."`；
+3. （可选）指向其他 OpenAI 兼容端点：`export DASHSCOPE_BASE_URL="https://..."`。
+
+该 Key 用于 Qwen3.8-Omni 声学说话人分离。阶段 1 会做前置检查：未配置时流水线会显式询问——配置 Key 后重跑，或明确选择"说话人列留空"继续（`speaker_diarize.py run` 以退出码 8 二次拦截）。
+
 ## 工作原理
 
 1. **纯净三层工作区** —— `materials/`（只读输入）→ `.cache/`（可随时清空的中间产物）→ `output/`（只放最终剧本）。

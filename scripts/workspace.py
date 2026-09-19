@@ -15,8 +15,11 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Any, List
+
+import omni_client
 
 
 def safe_workspace_path(path: str) -> str:
@@ -150,13 +153,23 @@ def probe_materials(workspace_root: str) -> Dict[str, Any]:
 
 
 def run_doctor_check(workspace: Path | str | None = None) -> None:
-    """Inspect and report readiness of runtime tools, python audio-visual packages, and paths."""
+    """Inspect and report readiness of runtime tools, python audio-visual packages,
+    and the acoustic-diarization API key (presence only - the key value NEVER
+    enters the report, logs or any file)."""
+    key = omni_client.resolve_key()
+    base_host = urllib.parse.urlsplit(omni_client.resolve_base_url()).hostname or ""
     report = {
         "ffmpeg": {"ready": False, "path": shutil.which("ffmpeg"), "version": None},
         "ffprobe": {"ready": False, "path": shutil.which("ffprobe"), "version": None},
         "numpy": {"ready": False, "version": None},
-        "diarization_engine": "qwen3_8_omni_acoustic_diarization (MCP: omni_multi_speaker_asr; "
-                              "falls back to all-null speakers without it)",
+        "diarization": {
+            "ready": bool(key),
+            "dashscope_api_key": "set" if key else "missing",
+            "dashscope_base_url_host": base_host,
+            "model": omni_client.resolve_model(),
+            "note": "acoustic speaker diarization (Qwen3.8-Omni) needs DASHSCOPE_API_KEY; "
+                    "without it, continue only after an explicit user choice (speakers stay blank)",
+        },
         "platform": sys.platform
     }
 
