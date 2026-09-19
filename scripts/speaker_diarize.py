@@ -2,17 +2,19 @@
 """
 scripts/speaker_diarize.py - Acoustic Speaker Diarization Bridge (Qwen3.8-Omni)
 
-Two-phase workflow around the `omni_multi_speaker_asr` MCP tool (Qwen-MM-Plugins,
-default model qwen3.8-omni-flash), mirroring narrative_outline.py's workorder
-pattern ("deterministic prep here, perception task delegated to the agent"):
+Three actions around one workorder (mirroring narrative_outline.py's pattern
+"deterministic prep here, perception task delegated to the model"):
 
   prepare : ffmpeg-extract 16 kHz mono audio (auto-chunked into <=45 min parts
             when the video runs past 50 min), write diarize_workorder.json with
-            the exact MCP invocation + expected save paths, then EXIT 6 so the
-            agent performs the MCP calls.
-  merge   : validate the saved Omni outputs, restore part offsets, bind every
-            subtitle line to the max-overlap voice cluster, name clusters by
-            majority vote over subtitle metadata names, print speakers.json.
+            the expected save paths, then EXIT 6 awaiting perception.
+  run     : (recommended) dial DashScope DIRECTLY per part - omni_client.py
+            streams the same qwen3.8-omni-flash request the MCP tool would,
+            with code-owned retries/backoff/resume and no client tool window.
+  merge   : validate the saved Omni outputs (from `run` or from manual MCP
+            calls - same schema), restore part offsets, bind every subtitle
+            line to the max-overlap voice cluster, name clusters by majority
+            vote over subtitle metadata names, print speakers.json.
 
 Separation of concerns (hard rules):
 - WHO speaks (attribution) is 100% acoustic, decided by the Omni model's timbre
@@ -30,8 +32,9 @@ plus a WARN - the pipeline keeps running, equivalent to the legacy
 text-syntax per-line assignment) is intentionally removed.
 
 Exit codes: 0 success | 1 bad input | 3 ffmpeg/ffprobe missing
-            4 audio extraction failed | 6 workorder written, awaiting MCP call
-            7 Omni outputs missing/invalid/parts incomplete at merge stage.
+            4 audio extraction failed | 6 workorder written, awaiting perception
+            7 Omni outputs missing/invalid/parts incomplete at merge stage
+            8 DASHSCOPE_API_KEY missing (run only).
 """
 
 import argparse
@@ -45,6 +48,8 @@ from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import omni_client
 
 SPEAKER_LABEL_RE = re.compile(r"^SPEAKER_[A-Z0-9]+$")
 
@@ -69,6 +74,8 @@ EXIT_MISSING_FFMPEG = 3
 EXIT_EXTRACT_FAILED = 4
 EXIT_AWAITING_OMNI = 6
 EXIT_OMNI_OUTPUT_INVALID = 7
+EXIT_MISSING_KEY = 8
+RUN_PART_WARN_SEC = 1500.0     # 25 min: beyond this, direct-call wall clock nears the ceiling
 
 ATTRIBUTION_METHOD = "qwen3_8_omni_acoustic_diarization"
 MCP_TOOL_NAME = "omni_multi_speaker_asr"
@@ -322,9 +329,12 @@ def make_workorder(video_path: str, duration_ms: Optional[int], parts: List[Tupl
         "expected_segment_schema": {"speaker": "<label>", "start": 0.0, "end": 0.0, "text": "<text>"},
         "parts": part_entries,
         "note": (
-            "Call the MCP tool once per part with format='json' (pass num_speakers only when "
-            "the bible states the cast size; omit language to auto-detect), then save each "
-            "returned JSON block verbatim to the matching 'output' path."
+            "Path A (recommended): `speaker_diarize.py --workspace <ws> run` dials DashScope "
+            "directly (needs DASHSCOPE_API_KEY; no client tool-timeout window; finished parts "
+            "are kept - rerun `run` to retry only the missing ones). Path B (fallback): call "
+            f"the MCP tool {MCP_TOOL_NAME} once per part with format='json' (pass num_speakers "
+            "only when the bible states the cast size; omit language to auto-detect). Either "
+            "way every result JSON lands verbatim at the matching 'output' path before `merge`."
             if not no_audio else
             "The video has no audio stream: skip the MCP call entirely and run "
             "`merge --empty-fallback` to emit an all-null speakers.json."
@@ -394,10 +404,122 @@ def cmd_prepare(ws: Optional[str], video_override: Optional[str], num_speakers: 
     else:
         sys.stderr.write(
             f"[PENDING] Workorder written: {workorder_path}\n"
-            f"[PENDING] Next: agent calls MCP {MCP_TOOL_NAME} per part (format='json') and saves each\n"
-            f"[PENDING] JSON block verbatim to the listed 'output' paths, then reruns `merge`.\n"
+            f"[PENDING] Path A (recommended): speaker_diarize.py --workspace <ws> run   (direct API)\n"
+            f"[PENDING] Path B (fallback): agent calls MCP {MCP_TOOL_NAME} per part (format='json'), saves\n"
+            f"[PENDING] each JSON block verbatim to the listed 'output' paths; either way, then run `merge`.\n"
         )
     sys.exit(EXIT_AWAITING_OMNI)
+
+
+def cmd_run(ws: Optional[str], force: bool = False) -> None:
+    """Direct-API execution of a prepared workorder (path A): call DashScope per
+    part via omni_client, save each result verbatim to the workorder's output
+    path, keep finished parts (resume), and never let one part's failure stop
+    the rest. Exits 0 when every output is present, 7 otherwise, 8 without a
+    key while work is pending."""
+    audio_dir = Path(ws, ".cache", "audio") if ws else Path(".cache", "audio")
+    workorder_path = (audio_dir / "diarize_workorder.json").resolve()
+    if ws:
+        try:
+            workorder_path.relative_to(Path(ws).resolve())
+        except ValueError:
+            sys.stderr.write(f"[FATAL] Workorder path escaped the workspace containment: {workorder_path}\n")
+            sys.exit(2)
+    if not workorder_path.is_file():
+        sys.stderr.write(f"[FATAL] diarize_workorder.json not found: {workorder_path} (run `prepare` first)\n")
+        sys.exit(EXIT_BAD_INPUT)
+    try:
+        work = json.loads(workorder_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        sys.stderr.write(f"[FATAL] Cannot parse workorder {workorder_path}: {e}\n")
+        sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+    if work.get("status") == "no_audio_stream":
+        sys.stderr.write("[FATAL] Video has no audio stream; run `merge --empty-fallback` instead\n")
+        sys.exit(EXIT_BAD_INPUT)
+    parts = [p for p in work.get("parts", []) if isinstance(p, dict)]
+    if not parts:
+        sys.stderr.write("[FATAL] Workorder lists no parts\n")
+        sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+
+    def contained(pth: Path, what: str) -> Path:
+        if ws:
+            try:
+                pth.relative_to(Path(ws).resolve())
+            except ValueError:
+                sys.stderr.write(f"[FATAL] {what} escaped the workspace containment: {pth}\n")
+                sys.exit(2)
+        return pth
+
+    def output_path(p: Dict[str, Any]) -> Path:
+        return contained((audio_dir / os.path.basename(p["output"])).resolve(), "Omni output path")
+
+    def part_audio_path(p: Dict[str, Any]) -> Path:
+        return contained((audio_dir.parent / p["file"]).resolve(), "Audio part path")
+
+    def is_valid_output(pth: Path) -> bool:
+        try:
+            data = json.loads(pth.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        return bool(normalize_omni_segments(data, 0))
+
+    # Long parts stream for roughly 0.5-1x their audio length; warn before any spend.
+    for p in parts:
+        dur = (int(p.get("end_ms", 0)) - int(p.get("start_ms", 0))) / 1000.0
+        if dur > RUN_PART_WARN_SEC:
+            sys.stderr.write(
+                f"[WARN] Part {os.path.basename(p['file'])} runs {dur / 60.0:.0f} min; a direct call may "
+                f"stream for {dur / 120.0:.0f}-{dur / 60.0:.0f} min and can die at the timeout ceiling. If it "
+                "does, re-prepare with --chunk-seconds 1200 or raise V2S_OMNI_TIMEOUT_SEC.\n")
+
+    pending = [p for p in parts if force or not (output_path(p).is_file() and is_valid_output(output_path(p)))]
+    key = omni_client.resolve_key()
+    if pending and not key:
+        sys.stderr.write(
+            "[FATAL] DASHSCOPE_API_KEY is not set in the environment; direct calls are impossible.\n"
+            "[FATAL] Options: (a) export DASHSCOPE_API_KEY=... and rerun `run`;\n"
+            f"        (b) call MCP {MCP_TOOL_NAME} per the workorder (fallback path B);\n"
+            "        (c) `merge --empty-fallback` to continue with all speakers null.\n")
+        sys.exit(EXIT_MISSING_KEY)
+
+    failed: List[str] = []
+    for i, p in enumerate(parts):
+        out_p = output_path(p)
+        if not force and out_p.is_file() and is_valid_output(out_p):
+            sys.stderr.write(f"[SKIP] part{i:03d}: {out_p.name} already present and valid (--force to redo)\n")
+            continue
+        in_p = part_audio_path(p)
+        if not in_p.is_file():
+            sys.stderr.write(f"[ERROR] part{i:03d}: audio file missing: {in_p.name}\n")
+            failed.append(f"part{i:03d} audio missing")
+            continue
+        dur = (int(p.get("end_ms", 0)) - int(p.get("start_ms", 0))) / 1000.0
+        sys.stderr.write(f"[RUN ] part{i:03d}: {in_p.name} ({dur / 60.0:.1f} min) -> {out_p.name}\n")
+        try:
+            result = omni_client.diarize_audio_file(
+                str(in_p), api_key=key, num_speakers=work.get("num_speakers_hint"),
+                language=work.get("language_hint"), duration_sec=dur or None)
+        except omni_client.OmniError as e:
+            sys.stderr.write(f"[ERROR] part{i:03d}: {e}\n")
+            failed.append(f"part{i:03d} {e.kind}" + (f" {e.status}" if e.status else ""))
+            continue
+        except Exception as e:  # noqa: BLE001 - one part must not stop the others
+            sys.stderr.write(f"[ERROR] part{i:03d}: {type(e).__name__}: {str(e)[:200]}\n")
+            failed.append(f"part{i:03d} {type(e).__name__}")
+            continue
+        out_p.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        sys.stderr.write(f"[OK  ] part{i:03d}: {len(result.get('segments') or [])} segments -> {out_p.name}\n")
+
+    missing = [os.path.basename(p["output"]) for p in parts if not output_path(p).is_file()]
+    if missing or failed:
+        sys.stderr.write(
+            f"[FATAL] run incomplete: {len(failed)} failed call(s); missing outputs: "
+            f"{', '.join(missing) if missing else '(none saved)'}\n"
+            "[FATAL] Fix the cause and rerun `run` - finished parts are kept (resume) - or fall\n"
+            f"        back to MCP {MCP_TOOL_NAME} per the workorder / `merge --empty-fallback`.\n")
+        sys.exit(EXIT_OMNI_OUTPUT_INVALID)
+    sys.stderr.write(f"[DONE ] all {len(parts)} part output(s) present; next: `merge`\n")
+    sys.exit(EXIT_OK)
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +758,9 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
                  names: Dict[str, Optional[str]],
                  manifest: Dict[str, int], parts_used: List[str],
                  empty_reason: Optional[str] = None,
-                 subtitle_alignment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                 subtitle_alignment: Optional[Dict[str, Any]] = None,
+                 backend: Optional[str] = None,
+                 part_metas: Optional[List[Optional[Dict[str, Any]]]] = None) -> Dict[str, Any]:
     named_rows = []
     for r in rows:
         row = dict(r)
@@ -660,6 +784,8 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
         })
 
     unattributed = sum(1 for r in named_rows if r["speaker"] is None)
+    metas = [m for m in (part_metas or []) if isinstance(m, dict)]
+    models = sorted({str(m["model"]) for m in metas if m.get("model")})
     return {
         "video_path": video_name,
         "total_segments": len(named_rows),
@@ -670,8 +796,9 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
         "degradation": empty_reason,
         "diarization_source": {
             "tool": MCP_TOOL_NAME,
-            "model": "qwen3.8-omni-flash (MCP default)",
+            "model": ("; ".join(models) if models else "qwen3.8-omni-flash (MCP default)"),
             "parts": parts_used,
+            "backend": backend or "mcp_tool",
         },
         "subtitle_alignment": subtitle_alignment,
         "characters_manifest": manifest,
@@ -702,10 +829,12 @@ def _empty_output(video_name: str, items: List[Dict[str, Any]], reason: str) -> 
     return build_output(video_name, items, rows, {}, [], {}, {}, [], empty_reason=reason)
 
 
-def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
+def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]], List[Optional[Dict[str, Any]]]]:
     """Collect the saved Omni outputs per the workorder (or a legacy single
     omni_diarized.json), tag turns with their part, and link cross-part
-    identities via build_cluster_map. Exit 7 naming missing/invalid files."""
+    identities via build_cluster_map. Returns (used files, turns, per-part meta
+    blocks - the direct-API path stamps provenance the MCP path lacks). Exit 7
+    naming missing/invalid files."""
     audio_dir = Path(ws, ".cache", "audio") if ws else Path(".cache", "audio")
     workorder_path = (audio_dir / "diarize_workorder.json").resolve()
     if ws:
@@ -735,6 +864,7 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
     used: List[str] = []
     turns: List[Dict[str, Any]] = []
     missing: List[str] = []
+    metas: List[Optional[Dict[str, Any]]] = []
     for idx, (fname, offset) in enumerate(expectations):
         path = (audio_dir / fname).resolve()
         if ws:
@@ -760,20 +890,22 @@ def load_omni_parts(ws: Optional[str]) -> Tuple[List[str], List[Dict[str, Any]]]
         for t in part_turns:
             t["part"] = idx
             t["part_file"] = fname
+        meta = data.get("meta") if isinstance(data, dict) and isinstance(data.get("meta"), dict) else None
+        metas.append(meta)
         used.append(fname)
         turns.extend(part_turns)
     if missing:
         sys.stderr.write("[FATAL] Missing Omni output(s) for: "
                          f"{', '.join(missing)}\n"
-                         f"[FATAL] Call MCP {MCP_TOOL_NAME} per the workorder and save each JSON "
-                         "block verbatim, then rerun `merge`.\n")
+                         "[FATAL] Rerun `run` (direct API, keeps finished parts) or call MCP "
+                         f"{MCP_TOOL_NAME} per the workorder, then rerun `merge`.\n")
         sys.exit(EXIT_OMNI_OUTPUT_INVALID)
 
     turns.sort(key=lambda t: (t["start_ms"], t["end_ms"], t["raw_label"]))
     cluster_map = build_cluster_map(turns) if turns else {}
     for t in turns:
         t["cluster_id"] = cluster_map[(t["part"], t["raw_label"])]
-    return used, turns
+    return used, turns, metas
 
 
 def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: str,
@@ -799,7 +931,9 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
             ensure_ascii=False, indent=2) + "\n")
         return
 
-    parts_used, turns = load_omni_parts(ws)
+    parts_used, turns, metas = load_omni_parts(ws)
+    backend = ("direct_api" if any(isinstance(m, dict) and m.get("backend") == "direct_api"
+                                   for m in metas) else "mcp_tool")
 
     if not turns:
         rows, cluster_lines = bind_lines(items, [])
@@ -807,7 +941,8 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
                          "(check the audio track / subtitle tier)\n")
         sys.stdout.write(json.dumps(
             build_output(video_name, items, rows, {}, [], {}, {}, parts_used,
-                         empty_reason="omni_returned_no_speech"),
+                         empty_reason="omni_returned_no_speech",
+                         backend=backend, part_metas=metas),
             ensure_ascii=False, indent=2) + "\n")
         return
 
@@ -825,7 +960,8 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
     names, manifest = name_clusters(cluster_lines)
     sys.stdout.write(json.dumps(
         build_output(video_name, items, rows, cluster_lines, turns,
-                     names, manifest, parts_used, subtitle_alignment=alignment),
+                     names, manifest, parts_used, subtitle_alignment=alignment,
+                     backend=backend, part_metas=metas),
         ensure_ascii=False, indent=2) + "\n")
 
 
@@ -833,10 +969,12 @@ def cmd_merge(ws: Optional[str], subtitles_override: Optional[str], video_name: 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Acoustic speaker diarization bridge around MCP omni_multi_speaker_asr "
-                    "(Qwen3.8-Omni). Attribution=acoustic; naming=metadata majority vote.")
-    parser.add_argument("action", nargs="?", default=None, choices=["prepare", "merge"],
+        description="Acoustic speaker diarization bridge (Qwen3.8-Omni): direct DashScope `run` "
+                    "or MCP omni_multi_speaker_asr fallback. Attribution=acoustic; "
+                    "naming=metadata majority vote.")
+    parser.add_argument("action", nargs="?", default=None, choices=["prepare", "run", "merge"],
                         help="prepare: extract audio + write workorder (exit 6). "
+                             "run: call DashScope directly per part (needs DASHSCOPE_API_KEY). "
                              "merge: bind saved Omni outputs to subtitle lines -> speakers.json")
     parser.add_argument("--workspace", "-w", default=None, help="Workspace root directory")
     parser.add_argument("--video", "-v", default=None, help="Override video path (prepare)")
@@ -849,6 +987,8 @@ def main() -> None:
                              "overlap); use ~30-40 when single-part MCP calls time out")
     parser.add_argument("--empty-fallback", action="store_true",
                         help="merge only: emit all-null speakers.json (MCP unavailable / no audio)")
+    parser.add_argument("--force", action="store_true",
+                        help="run only: re-diagnose parts whose output files already exist")
     args = parser.parse_args()
 
     ws = os.path.abspath(args.workspace) if args.workspace else None
@@ -857,10 +997,12 @@ def main() -> None:
 
     if args.action == "prepare":
         cmd_prepare(ws, args.video, args.num_speakers, args.language, args.chunk_seconds)
+    elif args.action == "run":
+        cmd_run(ws, force=args.force)
     elif args.action == "merge":
         cmd_merge(ws, args.subtitles, video_name, args.empty_fallback)
     else:
-        parser.error("action required: prepare | merge (see --help)")
+        parser.error("action required: prepare | run | merge (see --help)")
 
 
 if __name__ == "__main__":

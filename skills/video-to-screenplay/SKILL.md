@@ -1,11 +1,11 @@
 ---
 name: video-to-screenplay
-description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（MCP omni_multi_speaker_asr，不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
+description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
 ---
 
 # 视频转剧本流水线（`video-to-screenplay`）
 
-一条逆向还原流水线：把视频反编译为制作级亚洲场号制剧本，附带关键帧真实画面依据、声学说话人归属、画外台词标注与逐字台词。确定性的 Python 阶段负责一切可量化的计算；感知型任务统一交给通用多模态模型——场景理解由 agent 本身逐场完成，说话人**归属**由 MCP 工具 `omni_multi_speaker_asr`（Qwen3.8-Omni 按音色聚类，对 BGM/背景音鲁棒）完成，角色**命名**只由字幕元数据多数票或场景理解 pass 给出。台词文本始终只来自字幕，经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都绝不参与台词文本本身。
+一条逆向还原流水线：把视频反编译为制作级亚洲场号制剧本，附带关键帧真实画面依据、声学说话人归属、画外台词标注与逐字台词。确定性的 Python 阶段负责一切可量化的计算；感知型任务统一交给通用多模态模型——场景理解由 agent 本身逐场完成，说话人**归属**由声学分离完成（`speaker_diarize.py run` 经 `omni_client.py` 直连 DashScope 调 Qwen3.8-Omni 按音色聚类，对 BGM/背景音鲁棒；MCP `omni_multi_speaker_asr` 为回退），角色**命名**只由字幕元数据多数票或场景理解 pass 给出。台词文本始终只来自字幕，经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都绝不参与台词文本本身。
 
 ---
 
@@ -23,9 +23,9 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
     │   └── keyframes/             镜头缩略图（shot_XXXX_XXXXXXms.jpg）
     ├── audio/
     │   ├── speakers.json          声学说话人标签 + characters_manifest
-    │   ├── diarize_workorder.json 说话人工作单（prepare 产物，指引 MCP 调用）
+    │   ├── diarize_workorder.json 说话人工作单（prepare 产物，指引 run / MCP 调用）
     │   ├── source_audio*.m4a      16k 单声道抽取音频（>50 分钟自动分片）
-    │   └── omni_diarized*.json    MCP omni_multi_speaker_asr 原始返回（证据，只读）
+    │   └── omni_diarized*.json    声学分离原始返回（run 直连或 MCP，证据，只读）
     ├── alignment/
     │   ├── aligned_timeline.json  镜头↔台词主对齐（每条台词恰好分配一次）
     │   └── scene_manifest.json    场景证据包 + 写作契约（阶段 4）
@@ -86,27 +86,30 @@ python3 scripts/scene_detect.py --workspace "<ws>" --threshold 0.35 > "<ws>/.cac
 PID_VISUAL=$!
 # 台词轨（前台）
 python3 scripts/subtitle_extractor.py --workspace "<ws>" --require-subtitles > "<ws>/.cache/subtitles/extracted.json"
-# 声学说话人三步：prepare（抽音频 + 工作单）→ MCP 声学分离 → merge（绑定 + 命名）
+# 声学说话人三步：prepare（抽音频 + 工作单）→ run 直连（或 MCP 回退）→ merge（绑定 + 命名）
 python3 scripts/speaker_diarize.py --workspace "<ws>" prepare > "<ws>/.cache/audio/diarize_workorder.json"
 wait $PID_VISUAL
 ```
 
 - `scene_detect.py` 把镜头 JSON 打印到 **stdout**（纯过滤器；按示例重定向）。缺 FFmpeg → 退出码 3。
-- `speaker_diarize.py prepare` 用 ffmpeg 抽 16k 单声道音频；多分片时切点**吸附静音点**（silencedetect，±5s 容差）、相邻分片**重叠 ±3 秒**（merge 据此跨片对齐身份）；默认 >50 分钟自动分片，单次 MCP 调用超时/失败时用 `prepare --chunk-seconds 30~40` 重切重试。写 `diarize_workorder.json` 后**退出码 6**——等待你完成 MCP 调用。无音频流的工作单 `status=no_audio_stream`。
+- `speaker_diarize.py prepare` 用 ffmpeg 抽 16k 单声道音频；多分片时切点**吸附静音点**（silencedetect，±5s 容差）、相邻分片**重叠 ±3 秒**（merge 据此跨片对齐身份）；默认 >50 分钟自动分片，直连单调用死于超时时用 `prepare --chunk-seconds 1200` 重切。写 `diarize_workorder.json` 后**退出码 6**——等待感知完成（路径 A 或 B）。无音频流的工作单 `status=no_audio_stream`。
 
-**声学分离（你的 MCP 步骤）**：对工作单 `parts[]` 的每一片调用 MCP 工具
-`omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：
-- 参数：`file_path` = 分片绝对路径，`format: "json"`；`num_speakers` 仅当 bible 明确人数时传；`language` 默认不传（自动检测）。
-- **上下文卫生（建议）**：此循环是纯机械动作（调工具 → 存文件），**委托一个子代理执行**——每片的工具返回（JSON 与 SRT 双份文本，整集约 2–3 万 token、电影十万级）只进子代理上下文，主会话只收"全部已保存"的一句结果。上游不稳时在子代理内做"等待 2–3 分钟重试 / 失败片对半切"的循环即可。
-- 把每个返回的 **JSON block 原样保存**到工作单指定的 `output` 路径（`.cache/audio/omni_diarized[.partNNN].json`）——形如 `{"speakers": [...], "segments": [{"speaker","start","end","text"}]}`（秒制）。
-- 分离质量由模型音色聚类保证（对音乐/背景音鲁棒）；**Omni 转写文本只作证据**（`text_agreement` 校验用），绝不进剧本正文。
+**声学分离（两条路径，产物同 schema）**：
+
+- **路径 A（推荐）`run` 直连**——脚本经 `omni_client.py` 直调 DashScope（key 只从环境变量 `DASHSCOPE_API_KEY` 读，缺失退出码 8 并给出三条出路）：
+  ```bash
+  python3 scripts/speaker_diarize.py --workspace "<ws>" run
+  ```
+  无客户端工具窗口——流式延迟约 0.5–1×音频时长（24 分钟单片 ≈ 10–20 分钟），**用后台任务执行**；瞬态错误（超时/连接/429/5xx/空补全）代码化指数退避（`V2S_OMNI_ATTEMPTS` 默认 3），单片失败不阻塞其余分片；**断点续跑**——重跑 `run` 只补缺失分片，`--force` 全部重做。单分片 >25 分钟会 WARN（改用 `prepare --chunk-seconds 1200` 重切）。日志只含异常类型+状态码+主机名，key 绝不落盘、绝不进日志。
+- **路径 B（回退）MCP 工具**——对工作单 `parts[]` 的每一片调用 MCP `omni_multi_speaker_asr`（Qwen-MM-Plugins `api` 插件；默认模型 qwen3.8-omni-flash）：`file_path` = 分片绝对路径，`format: "json"`；`num_speakers` 仅当 bible 明确人数时传；`language` 默认不传（自动检测）。**上下文卫生**：此循环是纯机械动作（调工具 → 存文件），**委托一个子代理执行**——每片的工具返回（JSON 与 SRT 双份文本）只进子代理上下文，主会话只收"全部已保存"的一句结果；把每个返回的 JSON block 原样保存到工作单指定的 `output` 路径。
+- 两条路径产物一致：`{"speakers": [...], "segments": [{"speaker","start","end","text"}]}`（秒制；直连多一个 `meta` 溯源块，merge 端忽略）。分离质量由模型音色聚类保证（对音乐/背景音鲁棒）；**Omni 转写文本只作证据**（`text_agreement` 校验用），绝不进剧本正文。
 
 ```bash
 python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
 ```
 
 - `merge` 确定性执行：分片时间偏移还原 → **跨片身份对齐**（不同分片的标签是局部命名空间，只有重叠区里同一段语音被两片各自标出——共现证据——才经 union-find 合并；无证据不合并，宁拆不并）→ **全局字幕-音频偏移估计**（字幕只是粗框，常整体超前音频 1–3 秒；±5s/0.25s 步长互相关求最优整体偏移，≥6 行才启用）→ 每条字幕按**校正后最大时间重叠**绑定音色簇（`SPEAKER_A1…`，重叠 ≥40% 的次簇记入 `secondary_speaker`，覆盖重叠对话）→ 元数据多数票（份额 ≥0.6 且 ≥2 票）给簇**起名**。**归属 100% 归声学，元数据只起名、绝不改判归属**；Omni 转写与字幕的一致性记入 `text_agreement` 仅作报告。
-- 未配置 qwen-mm-plugins / 无 DASHSCOPE_API_KEY / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
+- 无 DASHSCOPE_API_KEY 且无 MCP 插件 / 无音频流 → 改跑 `merge --empty-fallback`：生成说话人全 `null` 的合法 `speakers.json` + WARN，流水线继续（等价于"未归属"状态），成稿说话人列留空。
 
 🔴 **检查点**：`shots.json` 已生成、`failed_keyframes[]` 已记录；`extracted.json` 非空；`speakers.json` 已产出（声学合并或 `--empty-fallback` 皆可）。
 
@@ -171,9 +174,11 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 失败情形 | 信号 | 响应 |
 | :--- | :--- | :--- |
 | 完全没有字幕 | probe 为空 + 用户确认 | 硬性拒绝，退出码 5，请求在 `materials/` 放置 `.srt`/`.ass` |
-| qwen-mm-plugins 未安装 / 无 DASHSCOPE_API_KEY | prepare（退出码 6）后无法调用 MCP | `merge --empty-fallback`：speakers.json 全 null + WARN，流水线继续，说话人列留空 |
-| Omni 输出缺失/非法/分片不全 | merge **退出码 7** 并点名文件 | 按 `diarize_workorder.json` 补做对应分片的 MCP 调用后重跑 `merge` |
-| 单次 MCP 调用超时/失败（长音频、客户端执行窗口、上游波动） | 工具执行超时或连接中断 | `prepare --chunk-seconds 30~40` 重切后逐片重调（上游不稳时等待 1–3 分钟再试） |
+| 无 DASHSCOPE_API_KEY（路径 A 首次执行） | run **退出码 8** | 三选一：配 key 重跑 run；走路径 B 调 MCP；`merge --empty-fallback` 全 null 继续 |
+| 直连单片网络瞬态（超时/连接/429/5xx/空补全） | run 内已自动指数退避重试（`V2S_OMNI_ATTEMPTS` 默认 3） | 重试耗尽的分片报 ERROR 但不阻塞其余；处置后重跑 `run` 只补缺 |
+| 直连单调用近超时天花板（超长分片） | run 对 >25 分钟分片 WARN；调用死于超时 | `prepare --chunk-seconds 1200` 重切后重跑 `run` |
+| Omni 输出缺失/非法/分片不全 | merge **退出码 7** 并点名文件 | 重跑 `run`（断点续跑只补缺）或按工作单补做对应分片的 MCP 调用，再重跑 `merge` |
+| 单次 MCP 调用超时/失败（路径 B：客户端执行窗口、上游波动） | 工具执行超时或连接中断 | `prepare --chunk-seconds 30~40` 重切后逐片重调（上游不稳时等待 1–3 分钟再试），或改走路径 A |
 | 视频无音频流 | 工作单 `status=no_audio_stream` | 直接 `merge --empty-fallback`；对白只存在于字幕层，流水线不受影响 |
 | Omni 返回零语音段 | merge WARN `omni_returned_no_speech` | 音轨可能为纯音乐/环境声；声学层留空不阻塞，后续阶段照常 |
 | 缺 ffprobe | probe `ffprobe_available: false` | 告警；内嵌字幕流选项不可用；`brew install ffmpeg` |
@@ -194,6 +199,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 为无声画面编造台词 | 硬性拒绝；无字幕 → 不开工 |
 | 把暂定标签渲染成真名 | `SPEAKER_*`（含声学 `SPEAKER_A*`）/ 未归属 → `人物`，直到场景理解 pass 给出命名 |
 | 用 Omni 转写文本代替字幕台词 | 转写仅作 `text_agreement` 证据；台词一律 `[[SUB:n]]` 逐字来自字幕 |
+| 把 API key 写进代码/命令行/证据文件 | key 只从环境变量读（无 key 时 run 以退出码 8 拒绝）；日志只含异常类型+状态码+主机名 |
 | 用字幕元数据改判声学归属 | 元数据只给声学簇**投票起名**（份额 ≥0.6、≥2 票）；"谁在说"永远由音色聚类决定 |
 | 幻觉动作行 | 动作草稿只写关键帧可见内容；未验证的镜头保持未验证 |
 | 在 DP 中硬禁台词切点 | 软惩罚 + `forced_dialogue_cuts` 报告——绝不用硬 INF 静默地把整集塌缩成一场 |

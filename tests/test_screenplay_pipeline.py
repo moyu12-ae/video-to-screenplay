@@ -11,11 +11,15 @@ Covers:
 - build_scene_manifest contract (manifest written inside the workspace, resume status)
 """
 
+import contextlib
+import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPTS_DIR = (Path(__file__).parent.parent / "scripts").resolve()
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -24,14 +28,18 @@ from subtitle_extractor import extract_speaker_from_text
 from speaker_diarize import (
     bind_lines,
     build_cluster_map,
+    build_output,
+    cmd_run,
     estimate_subtitle_offset_ms,
     is_provisional_label,
+    make_workorder,
     name_clusters,
     normalize_omni_segments,
     parse_silences,
     plan_parts,
     snap_boundaries,
 )
+import omni_client
 from align_timeline import infer_av_relationship
 
 
@@ -341,6 +349,250 @@ class TestSceneManifestBuilder(unittest.TestCase):
             (drafts_dir / "scene_01.md").write_text("## 第 1 场\n", encoding="utf-8")
             manifest2 = build_manifest(ws, max_keyframes=8)
             self.assertEqual(manifest2["scenes"][0]["draft_status"], "written")
+
+
+class TestOmniClient(unittest.TestCase):
+    """Pure-function coverage of the direct-API client (no network, no ffmpeg)."""
+
+    def test_select_audio_encoding_tiers(self):
+        budget = omni_client.INLINE_RAW_BUDGET_BYTES
+        self.assertEqual(omni_client.select_audio_encoding(10, budget, raw_size=100),
+                         ("passthrough", None))
+        self.assertEqual(omni_client.select_audio_encoding(200, 200 * omni_client.WAV_BYTES_PER_SEC),
+                         ("wav", None))
+        self.assertEqual(omni_client.select_audio_encoding(1440, budget), ("mp3", 40))  # 24 min
+        self.assertEqual(omni_client.select_audio_encoding(2700, budget), ("mp3", 16))  # 45 min
+        with self.assertRaises(ValueError):
+            omni_client.select_audio_encoding(5400, budget)                             # 90 min
+
+    def test_accumulate_sse_accumulates_and_stops(self):
+        lines = [': keep-alive', '',
+                 'data: {"choices":[{"delta":{"content":"Hello"}}]}',
+                 'data: {bad json',
+                 'data: {"choices":[{"delta":{"content":" world"}}]}',
+                 'data: {"choices":[],"usage":{"total_tokens":7}}',
+                 'data: [DONE]',
+                 'data: {"choices":[{"delta":{"content":" ignored"}}]}']
+        text, usage = omni_client.accumulate_sse(lines)
+        self.assertEqual(text, "Hello world")
+        self.assertEqual(usage, {"total_tokens": 7})
+
+    def test_accumulate_sse_accepts_bytes_lines(self):
+        text, _ = omni_client.accumulate_sse([b'data: {"choices":[{"delta":{"content":"ok"}}]}'])
+        self.assertEqual(text, "ok")
+
+    def test_extract_json_payload_variants(self):
+        self.assertEqual(omni_client.extract_json_payload('```json\n{"a": 1}\n```'), {"a": 1})
+        self.assertEqual(omni_client.extract_json_payload('Sure: {"a": 1} hope that helps'), {"a": 1})
+        self.assertEqual(omni_client.extract_json_payload('{"a": [1, 2,]}'), {"a": [1, 2]})
+        with self.assertRaises(ValueError):
+            omni_client.extract_json_payload("no structure at all")
+        with self.assertRaises(ValueError):
+            omni_client.extract_json_payload("   ")
+
+    def test_validate_endpoint_accepts_public_https(self):
+        url = omni_client.validate_endpoint(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            resolver=lambda host: ["8.8.8.8"])
+        self.assertEqual(url, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
+
+    def test_validate_endpoint_refuses_non_public(self):
+        for url in ["http://dashscope.aliyuncs.com/v1",      # not https
+                    "https://localhost/v1",
+                    "https://metadata.local/v1",
+                    "https://127.0.0.1/v1",
+                    "https://192.168.1.1/v1",
+                    "https://169.254.169.254/v1"]:           # cloud metadata
+            with self.assertRaises(omni_client.OmniError, msg=url):
+                omni_client.validate_endpoint(url, resolver=lambda host: ["8.8.8.8"])
+
+    def test_validate_endpoint_refuses_private_dns_resolution(self):
+        with self.assertRaises(omni_client.OmniError):
+            omni_client.validate_endpoint("https://internal.example.com/v1",
+                                          resolver=lambda host: ["10.0.0.5"])
+
+    def test_resolve_public_host_blocks_loopback(self):
+        fake = [(2, 1, 6, "", ("127.0.0.1", 443))]
+        with mock.patch.object(omni_client.socket, "getaddrinfo", return_value=fake):
+            with self.assertRaises(omni_client.OmniError):
+                omni_client.resolve_public_host("evil.example.com")
+
+    def test_resolve_public_host_accepts_global(self):
+        fake = [(2, 1, 6, "", ("8.8.8.8", 443))]
+        with mock.patch.object(omni_client.socket, "getaddrinfo", return_value=fake):
+            self.assertEqual(omni_client.resolve_public_host("api.example.com"), ["8.8.8.8"])
+
+    def test_omni_error_transient_classification(self):
+        for kind in ("rate_limited", "server", "timeout", "connection", "empty"):
+            self.assertTrue(omni_client.OmniError(kind).transient, kind)
+        for kind in ("auth", "bad_request", "http"):
+            self.assertFalse(omni_client.OmniError(kind).transient, kind)
+
+    def test_call_omni_chat_retries_transient_then_succeeds(self):
+        with mock.patch.object(omni_client, "validate_endpoint",
+                               side_effect=lambda u: u + "/chat/completions"), \
+             mock.patch.object(omni_client, "_post_stream",
+                               side_effect=[omni_client.OmniError("server", 503),
+                                            ("payload", {"total_tokens": 5})]), \
+             mock.patch.object(omni_client.time, "sleep"):
+            text, usage = omni_client.call_omni_chat(
+                [{"role": "user", "content": "hi"}], api_key="k", attempts=3)
+        self.assertEqual(text, "payload")
+        self.assertEqual(usage, {"total_tokens": 5})
+
+    def test_call_omni_chat_fails_fast_on_auth(self):
+        calls = []
+
+        def boom(*a, **kw):
+            calls.append(1)
+            raise omni_client.OmniError("auth", 401)
+
+        with mock.patch.object(omni_client, "validate_endpoint",
+                               side_effect=lambda u: u + "/chat/completions"), \
+             mock.patch.object(omni_client, "_post_stream", side_effect=boom):
+            with self.assertRaises(omni_client.OmniError):
+                omni_client.call_omni_chat([{"role": "user", "content": "hi"}],
+                                           api_key="k", attempts=3)
+        self.assertEqual(len(calls), 1)
+
+    def test_call_omni_chat_requires_key(self):
+        with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+            with self.assertRaises(omni_client.OmniError):
+                omni_client.call_omni_chat([{"role": "user", "content": "hi"}])
+
+
+class TestSpeakerDiarizeRun(unittest.TestCase):
+    """cmd_run integration on a temp workspace: no network (diarize_audio_file
+    stubbed), no ffmpeg - only workorder plumbing, resume and exit codes."""
+
+    def _make_ws(self, parts):
+        handle = tempfile.TemporaryDirectory()
+        self.addCleanup(handle.cleanup)
+        root = Path(handle.name)
+        audio_dir = root / ".cache" / "audio"
+        audio_dir.mkdir(parents=True)
+        work = {"status": "awaiting_omni_diarization",
+                "num_speakers_hint": None, "language_hint": None, "parts": []}
+        for i, (start_ms, end_ms) in enumerate(parts):
+            work["parts"].append({
+                "file": f"audio/source_audio.part{i:03d}.m4a",
+                "start_ms": start_ms, "end_ms": end_ms,
+                "output": f"audio/omni_diarized.part{i:03d}.json",
+            })
+            (audio_dir / f"source_audio.part{i:03d}.m4a").write_bytes(b"\x00" * 64)
+        (audio_dir / "diarize_workorder.json").write_text(
+            json.dumps(work, ensure_ascii=False, indent=2), encoding="utf-8")
+        return root, audio_dir
+
+    @staticmethod
+    def _fake_result():
+        return {"speakers": ["Speaker 1"],
+                "segments": [{"speaker": "Speaker 1", "start": 0.0, "end": 1.0, "text": "hi"}],
+                "meta": {"backend": "direct_api", "model": "qwen3.8-omni-flash"}}
+
+    def _run(self, ws, force=False):
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}):
+                    cmd_run(str(ws), force=force)
+        return ctx.exception.code, err.getvalue()
+
+    def test_cmd_run_requires_workorder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with self.assertRaises(SystemExit) as ctx:
+                with contextlib.redirect_stderr(err):
+                    with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-key"}):
+                        cmd_run(tmp)
+            self.assertEqual(ctx.exception.code, 1)
+
+    def test_cmd_run_missing_key_exits_8(self):
+        ws, _ = self._make_ws([(0, 60_000)])
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+                    cmd_run(str(ws))
+        self.assertEqual(ctx.exception.code, 8)
+        self.assertIn("DASHSCOPE_API_KEY", err.getvalue())
+
+    def test_cmd_run_skips_valid_outputs_without_key(self):
+        ws, audio_dir = self._make_ws([(0, 60_000)])
+        (audio_dir / "omni_diarized.part000.json").write_text(
+            json.dumps(self._fake_result()), encoding="utf-8")
+        err = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(err):
+                with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}):
+                    cmd_run(str(ws))
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("[SKIP]", err.getvalue())
+
+    def test_cmd_run_calls_model_and_writes_outputs(self):
+        ws, audio_dir = self._make_ws([(0, 60_000)])
+        with mock.patch.object(omni_client, "diarize_audio_file",
+                               return_value=self._fake_result()) as stub:
+            code, err = self._run(ws)
+        self.assertEqual(code, 0)
+        stub.assert_called_once()
+        saved = json.loads((audio_dir / "omni_diarized.part000.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["meta"]["backend"], "direct_api")
+        self.assertIn("[OK", err)
+
+    def test_cmd_run_one_failure_does_not_stop_other_parts(self):
+        ws, audio_dir = self._make_ws([(0, 60_000), (57_000, 120_000)])
+        with mock.patch.object(omni_client, "diarize_audio_file",
+                               side_effect=[omni_client.OmniError("server", 502),
+                                            self._fake_result()]):
+            code, err = self._run(ws)
+        self.assertEqual(code, 7)
+        self.assertFalse((audio_dir / "omni_diarized.part000.json").exists())
+        self.assertTrue((audio_dir / "omni_diarized.part001.json").exists())
+        self.assertIn("[ERROR]", err)
+
+    def test_cmd_run_resume_keeps_finished_parts(self):
+        ws, audio_dir = self._make_ws([(0, 60_000), (57_000, 120_000)])
+        (audio_dir / "omni_diarized.part000.json").write_text(
+            json.dumps(self._fake_result()), encoding="utf-8")
+        with mock.patch.object(omni_client, "diarize_audio_file",
+                               return_value=self._fake_result()) as stub:
+            code, err = self._run(ws)
+        self.assertEqual(code, 0)
+        stub.assert_called_once()  # only part001 was re-diagnosed
+        self.assertIn("[SKIP]", err)
+
+    def test_cmd_run_force_redoes_everything(self):
+        ws, audio_dir = self._make_ws([(0, 60_000)])
+        (audio_dir / "omni_diarized.part000.json").write_text(
+            json.dumps(self._fake_result()), encoding="utf-8")
+        with mock.patch.object(omni_client, "diarize_audio_file",
+                               return_value=self._fake_result()) as stub:
+            code, err = self._run(ws, force=True)
+        self.assertEqual(code, 0)
+        stub.assert_called_once()
+
+    def test_cmd_run_warns_on_overlong_part(self):
+        ws, audio_dir = self._make_ws([(0, 1_800_000)])  # 30 min
+        (audio_dir / "omni_diarized.part000.json").write_text(
+            json.dumps(self._fake_result()), encoding="utf-8")
+        code, err = self._run(ws)
+        self.assertEqual(code, 0)
+        self.assertIn("--chunk-seconds 1200", err)
+
+    def test_build_output_reports_backend_provenance(self):
+        out = build_output("v.mkv", [], [], {}, [], {}, {}, ["a.json"],
+                           backend="direct_api",
+                           part_metas=[{"backend": "direct_api", "model": "qwen3.8-omni-flash"}])
+        self.assertEqual(out["diarization_source"]["backend"], "direct_api")
+        self.assertEqual(out["diarization_source"]["model"], "qwen3.8-omni-flash")
+        default = build_output("v.mkv", [], [], {}, [], {}, {}, ["a.json"])
+        self.assertEqual(default["diarization_source"]["backend"], "mcp_tool")
+
+    def test_make_workorder_note_mentions_both_paths(self):
+        work = make_workorder("v.mkv", 60_000, [(0, 60_000)], None, None, no_audio=False)
+        self.assertIn("`run`", work["note"])
+        self.assertIn("omni_multi_speaker_asr", work["note"])
 
 
 if __name__ == "__main__":

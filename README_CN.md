@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（MCP `omni_multi_speaker_asr`，未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
+一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（由流水线自身直连 DashScope 完成——`speaker_diarize.py run`；MCP 工具 `omni_multi_speaker_asr` 作回退；未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
 
 ## 工作原理
 
 1. **纯净三层工作区** —— `materials/`（只读输入）→ `.cache/`（可随时清空的中间产物）→ `output/`（只放最终剧本）。
 2. **字幕门禁** —— 外挂字幕 → 容器内封软字幕 → OCR 网关；纯画面无字幕一律硬性拒止（退出码 5），绝不凭空捏造台词。
-3. **音画双轨并行** —— FFmpeg 切镜与关键帧提取，和字幕提取、**声学说话人分离**（ffmpeg 抽 16k 单声道音频 → MCP `omni_multi_speaker_asr` 按音色聚类 → 确定性最大重叠绑定到字幕行）并发执行。多分片时切点吸附静音、相邻片重叠 ±3 秒，跨片身份只认"重叠区同段语音"的共现证据（union-find 对齐，宁拆不并）；**归属 100% 归声学**，字幕元数据只给声学簇投票起名；MCP 不可用时说话人全 null 降级，流水线不阻塞。
+3. **音画双轨并行** —— FFmpeg 切镜与关键帧提取，和字幕提取、**声学说话人分离**（ffmpeg 抽 16k 单声道音频 → 直连客户端流式调用同一个 Qwen3.8-Omni 分离请求——代码化重试/退避、逐片断点续跑、无客户端工具窗口限制；MCP `omni_multi_speaker_asr` 保留为回退 → 确定性最大重叠绑定到字幕行）并发执行。多分片时切点吸附静音、相邻片重叠 ±3 秒，跨片身份只认"重叠区同段语音"的共现证据（union-find 对齐，宁拆不并）；**归属 100% 归声学**，字幕元数据只给声学簇投票起名；没有 API key（也没有 MCP 回退）时说话人全 null 降级，流水线不阻塞。
 4. **LGSS 思想场景聚类** —— 一维 DP 求解器把 200+ 物理切镜折叠为宏场景。对白穿越的剪切点施加**大额软惩罚**（绝非硬禁止——求解器不可能死锁成"整集一场"，任何被迫切口都会显式上报）。安装 numpy/opencv 后，启用关键帧 HSV 调色板距离（LGSS "place" 模态的轻量代理，理念源自 LGSS, CVPR 2020）锐化边界；未安装则优雅降级为静默/时长启发式。
 5. **毫秒级对齐** —— 每条台词按最大时间重叠唯一归属到一个镜头，并标注 `ON_SCREEN` / `OFF_SCREEN` / `VOICE_OVER` / `INTERNAL_MONOLOGUE`。
 6. **叙事大纲（可选，McKee 序列层）** —— `narrative_outline.py` 生成台词流工作单；agent 按「价值转折」判定写出序列骨架（题目 + 价值 from→to + 起止台词），grouper 随即切换为层级模式：序列墙吸附最近物理切点、逐序列独立求解场景。无大纲则整体平切，行为不变。
@@ -19,7 +19,7 @@
 
 - Python 3.10+
 - PATH 上有 FFmpeg / ffprobe（`brew install ffmpeg`）
-- 推荐：[Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 `api` 插件（配置 `DASHSCOPE_API_KEY`）——启用 Qwen3.8-Omni 声学说话人分离；未配置时说话人列留空，流水线照常运行
+- 推荐：环境变量 `DASHSCOPE_API_KEY`——启用直连 API 的 Qwen3.8-Omni 声学说话人分离（`speaker_diarize.py run`：无客户端工具窗口限制、指数退避重试、逐片断点续跑）。回退：[Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 `api` 插件（MCP）。两者皆无时说话人列留空，流水线照常运行
 - 可选：`pip install -r requirements.txt`（numpy + opencv-python-headless）——启用场景聚类的视觉 place 亲和度。其余全部纯标准库。
 
 ## 使用
@@ -38,10 +38,13 @@ python3 scripts/workspace.py probe --workspace "<ws>"
 python3 scripts/scene_detect.py --workspace "<ws>" --threshold 0.35 > "<ws>/.cache/visual/shots.json"
 python3 scripts/subtitle_extractor.py --workspace "<ws>" --require-subtitles > "<ws>/.cache/subtitles/extracted.json"
 python3 scripts/speaker_diarize.py --workspace "<ws>" prepare > "<ws>/.cache/audio/diarize_workorder.json"  # 退出码 6
-#   ↑ 随后由 agent 对工作单每个分片调用 MCP omni_multi_speaker_asr，
+python3 scripts/speaker_diarize.py --workspace "<ws>" run
+#   ↑ 路径 A（推荐）：直连 DashScope（环境变量 DASHSCOPE_API_KEY；
+#     代码化重试/退避、逐片断点续跑——重跑 run 只补缺失分片）。
+#   ↑ 路径 B（回退）：由 agent 对工作单每个分片调用 MCP omni_multi_speaker_asr，
 #     把返回 JSON 原样存到 .cache/audio/omni_diarized[.partNNN].json
 python3 scripts/speaker_diarize.py --workspace "<ws>" merge > "<ws>/.cache/audio/speakers.json"
-#   ↑ MCP 不可用时改跑：merge --empty-fallback（说话人全 null 降级）
+#   ↑ 两种后端皆不可用时改跑：merge --empty-fallback（说话人全 null 降级）
 python3 scripts/semantic_scene_grouper.py --workspace "<ws>" > "<ws>/.cache/visual/scenes.json"
 python3 scripts/narrative_outline.py --workspace "<ws>"   # 可选：agent 依工作单写叙事大纲后重跑校验
 python3 scripts/align_timeline.py --workspace "<ws>" > "<ws>/.cache/alignment/aligned_timeline.json"
@@ -58,6 +61,11 @@ python3 -m pytest tests/ -q
 
 完整 agent 工作流、场景写作契约与故障矩阵见 [SKILL.md](skills/video-to-screenplay/SKILL.md)。
 
+## 致谢
+
+- [Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins)（Apache-2.0）——`scripts/omni_client.py` 的直连客户端改编自其请求构造/音频装配/重试实现；分离提示词逐字保留。
+- [NarratoAI](https://github.com/linyqh/NarratoAI)（MIT）——瞬态重试与失败隔离的工程模式参考。
+
 ## 许可证
 
-MIT，见 [LICENSE](LICENSE)。
+MIT，见 [LICENSE](LICENSE)。第三方改编归属见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

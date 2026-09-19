@@ -111,3 +111,30 @@
 - **Result (ep3, 0–83 s)**: the contested line now binds to the correct speaker; three lines
   that previously fell outside every turn ("菈菈？", "这是水！", "明天打一场实战") are recovered;
   every in-range line is attributed (31/31).
+
+## 8. v0.4.0 — Direct API Backend (`speaker_diarize.py run`)
+
+- **Trigger (v0.3.x limitation)**: the zcode MCP client aborts tool calls at ~30 s, while
+  streaming A/V completions legitimately run for minutes (measured: a 40 s part took 20–60 s;
+  latency is ~0.5–1× audio length). Full episodes had to be shredded into 30–40 s parts — dozens
+  of calls, each an opportunity for the flaky upstream to kill the run; resilience lived in the
+  agent's improvised wait-retry loops instead of in code.
+- **Change**: `scripts/omni_client.py` (stdlib-only) dials DashScope's OpenAI-compatible endpoint
+  directly — same endpoint, model (qwen3.8-omni-flash) and diarization prompt as the MCP tool,
+  with the transport under code control: streaming SSE consumption, 1800 s timeout, exponential
+  backoff with jitter on transient errors (timeout / connection / 429 / 5xx / empty completion),
+  fail-fast on auth, per-part resume (`run` re-invocation retries only missing parts; `--force`
+  redoes everything). A 24-min episode becomes ONE call. `speaker_diarize.py` gains the `run`
+  action (exit 8 = key missing) and stamps `diarization_source.backend` (`direct_api` /
+  `mcp_tool`) into `speakers.json` for provenance; merge/binding/naming algorithms untouched.
+  MCP path fully preserved as fallback B.
+- **Provenance & licensing**: the client is adapted from Qwen-MM-Plugins (Apache-2.0) — request
+  shape, audio-fitting ladder, retry semantics and the diarization prompt (verbatim); full
+  attribution in `THIRD_PARTY_NOTICES.md` + `licenses/`. Engineering patterns (transient-only
+  retries, failure isolation) referenced from NarratoAI (MIT).
+- **Safety**: the API key is read only from the environment, never logged or persisted; the
+  endpoint must be https, resolve exclusively to globally routable addresses, and never redirect
+  (SSRF gate); logs carry exception kind + HTTP status + host only.
+- **Latency model (measured)**: streaming ≠ realtime — the model ingests the whole part before
+  the first token; a 24-min part ≈ 10–20 min wall clock. `run` warns on parts > 25 min
+  (re-prepare with `--chunk-seconds 1200` in that case) and should run in the background.
