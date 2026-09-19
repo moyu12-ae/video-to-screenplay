@@ -33,6 +33,9 @@ from typing import Any, Dict, List, Optional
 import op_ed
 
 THUMB_WIDTH = 640
+# Kept in sync with av_understand.AV_NOTES_SCHEMA by a test (importing that module
+# here would drag the network client into an offline stdlib-only stage).
+EXPECTED_AV_NOTES_SCHEMA = "vts-av-notes/v2"
 
 WRITING_CONTRACT = """\
 ## 写作合同（每场一个 scene_XX.md）
@@ -83,6 +86,9 @@ WRITING_CONTRACT = """\
    "有什么"而非"没什么"：禁止"他没有回答/什么也没发生/房间里一个人也没有"式
    否定句，写"他面无表情地看着对方，保持沉默。空荡荡的房间唯有座钟摆动"。
 6. 闪回/插入写 △【插入：…】/△【闪回：…】；字幕卡写（字幕卡：…）。
+   draft_status == "op_ed" 的场次已由脚本写好单行片头/片尾标注，不要动它；
+   若某场带 op_ed 标注却仍有 dialogues（台词恰好压在窗口边界上存活下来），
+   照常织入这些 [[SUB:n]]，并在场头下方单起一行写（动画 OP）/（动画 ED）。
 7. 叙事上下文：本清单若带 sequence_title/sequence_value（所属序列及其价值弧，
    如「误会与和解：负面 -> 正面」），先读它——场标题与 △ 要服务这条价值弧；
    同一序列内的相邻场要写出递进，禁止写成平行复读。
@@ -228,6 +234,10 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
 
     # Stage 3.7 evidence (optional): scene-grounded AV notes from av_understand.py
     av_doc = load_json(ws / ".cache" / "visual" / "av_notes.json") or {}
+    if av_doc and av_doc.get("schema") != EXPECTED_AV_NOTES_SCHEMA:
+        sys.stderr.write(f"[WARN] av_notes.json schema is {av_doc.get('schema')!r}, this build writes "
+                         f"{EXPECTED_AV_NOTES_SCHEMA!r} - stale evidence may lack dedup/substance fields; "
+                         "rerun av_understand.py merge.\n")
     av_by_scene = {str(n.get("scene_id")): n for n in (av_doc.get("scene_notes") or [])
                    if isinstance(n, dict) and n.get("scene_id")}
     if av_by_scene:
@@ -253,11 +263,22 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
         draft_path = drafts_dir / draft_name
         originals = sample_keyframes(shots, start_ms, end_ms, keyframes_dir, max_keyframes)
         op_ed_label = op_ed.matching_label(start_ms, end_ms, op_ed_windows)
-        if op_ed_label and not draft_path.is_file():
+        scene_dialogues = dialogues_by_scene.get(sid, [])
+        # A stub carries no [[SUB:n]], so it is only legal when the window filter left
+        # this scene with nothing to say. A line straddling the window edge survives
+        # (<=50% inside), and stubbing its scene would make splice FATAL on a
+        # placeholder no writer was ever asked to weave.
+        stub_eligible = bool(op_ed_label) and not scene_dialogues
+        if stub_eligible and not draft_path.is_file():
             # The stub IS the deliverable for these scenes: one line in the final
             # screenplay saying what the window is, nothing for the writer to do.
             draft_path.write_text(f"## 场 {idx}【{op_ed_label}】\n\n（动画 {op_ed_label}——按配置略）\n",
                                   encoding="utf-8")
+        elif op_ed_label and scene_dialogues:
+            sys.stderr.write(
+                f"[WARN] scene_{idx:02d} sits in the {op_ed_label} window but keeps "
+                f"{len(scene_dialogues)} surviving dialogue line(s) - authored as a normal "
+                "scene, because a stub cannot carry [[SUB:n]] placeholders.\n")
         manifest_scenes.append({
             "scene_index": idx,
             "scene_id": sid,
@@ -268,14 +289,14 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
             "sequence_index": sc.get("sequence_index"),
             "sequence_title": sc.get("sequence_title", ""),
             "sequence_value": sc.get("sequence_value", ""),
-            "keyframes_thumbs": [] if op_ed_label else make_thumbs(
+            "keyframes_thumbs": [] if stub_eligible else make_thumbs(
                 originals, thumbs_dir / f"scene_{idx:02d}", THUMB_WIDTH),
             "av_notes": av_by_scene.get(sid),
             "op_ed": op_ed_label,
             "child_shot_count": sc.get("child_shot_count"),
-            "dialogues": dialogues_by_scene.get(sid, []),
+            "dialogues": scene_dialogues,
             "draft_path": str(draft_path),
-            "draft_status": ("op_ed" if op_ed_label else
+            "draft_status": ("op_ed" if stub_eligible else
                              ("written" if draft_path.is_file() else "missing")),
         })
 

@@ -1149,5 +1149,161 @@ class TestAvHardening(unittest.TestCase):
             self.assertNotIn('"scene_notes"', out.getvalue())  # stdout is a summary, not the document
 
 
+class TestV052ContractGaps(unittest.TestCase):
+    """Regressions for the v0.5.1 review: each one reproduces a defect that was
+    verified on main before this branch."""
+
+    # --- dedup must not rewrite an earlier segment's committed row ---------
+    def test_dedup_does_not_rewrite_emitted_rows(self):
+        pool = []
+        seg1 = dedup_entries([{"start": 1_000, "end": 3_000, "who": "红衣女子", "what": "撑伞快走"}],
+                             pool, "what")
+        seg2 = dedup_entries([{"start": 2_500, "end": 9_000, "who": "红衣女子", "what": "撑伞快走"}],
+                             pool, "what")
+        self.assertEqual(seg2, [])                    # the overlap-zone duplicate is dropped
+        self.assertEqual(seg1[0]["end"], 3_000)       # what seg1 returned stays verbatim
+        self.assertEqual(pool[0]["end"], 9_000)       # the pool carries the merged span forward
+
+    def test_dedup_chain_matches_the_widest_pool_span(self):
+        """A third description of the same beat, 5 s after the first window ended, only
+        merges if the pool - not just the previous row - holds the widened span."""
+        pool = []
+        dedup_entries([{"start": 1_000, "end": 3_000, "who": "A", "what": "撑伞快走"}], pool, "what")
+        dedup_entries([{"start": 2_500, "end": 9_000, "who": "A", "what": "撑伞快走"}], pool, "what")
+        third = dedup_entries([{"start": 8_000, "end": 9_500, "who": "A", "what": "撑伞快走"}],
+                              pool, "what")
+        self.assertEqual(third, [])
+
+    # --- the resume gate must not mistake real evidence for emptiness ------
+    @staticmethod
+    def _note_file(payload):
+        p = _tmp_file(".json")
+        p.write_text(json.dumps({"raw": payload, "meta": {}}, ensure_ascii=False), encoding="utf-8")
+        return p
+
+    def test_resume_gate_accepts_late_timestamps_without_caption(self):
+        """v0.5.1 parsed the candidate with a synthetic 1-second span, so a note whose
+        only evidence is an action at 5 s read as empty and was re-billed on every run."""
+        p = self._note_file({"visual": {"caption": "", "actions": [
+            {"start": 5.0, "end": 8.0, "who": "红衣女子", "what": "撑伞快走"}]},
+            "acoustic": {"music_mood": ""}})
+        try:
+            self.assertTrue(av_understand_module._is_valid_note(p))
+        finally:
+            p.unlink()
+
+    def test_resume_gate_still_rejects_shapeless_notes(self):
+        payloads = [{}, {"visual": {}}, {"visual": {"caption": "   "}, "uncertain": [""]},
+                    {"visual": {"actions": [{}]}}, {"uncertain": [None, ""]}]
+        for payload in payloads:
+            p = self._note_file(payload)
+            try:
+                self.assertFalse(av_understand_module._is_valid_note(p), payload)
+            finally:
+                p.unlink()
+
+    # --- OP/ED filtering must be auditable and must feed the echo check ----
+    def test_filter_items_records_removed_text_and_reindexes(self):
+        windows = [{"start_ms": 84_000, "end_ms": 105_000, "label": "OP"}]
+        items = [{"index": 1, "start_ms": 85_000, "end_ms": 88_000, "text": "♪ 主题曲歌词 ♪"},
+                 {"index": 2, "start_ms": 106_000, "end_ms": 109_000, "text": "你终于来了"}]
+        kept, meta = op_ed.filter_items(items, windows)
+        self.assertEqual([it["index"] for it in kept], [1])
+        self.assertEqual(meta["removed_total"], 1)
+        self.assertEqual(meta["removed_lines"],
+                         [{"original_index": 1, "label": "OP", "start_ms": 85_000,
+                           "end_ms": 88_000, "text": "♪ 主题曲歌词 ♪"}])
+
+    def test_subtitle_norms_include_op_ed_filtered_lines(self):
+        """A hard-subbed ED echoes the very lines the filter removed upstream; the
+        echo check has to know about them or it stays blind exactly where it matters."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / ".cache" / "subtitles").mkdir(parents=True)
+            (ws / ".cache" / "subtitles" / "extracted.json").write_text(json.dumps({
+                "subtitle_count": 1,
+                "items": [{"index": 1, "start_ms": 200_000, "end_ms": 203_000, "text": "你终于来了"}],
+                "op_ed_filtered": {"removed_total": 1, "removed": {"ED": 1}, "removed_lines": [
+                    {"original_index": 9, "label": "ED", "start_ms": 1_330_000,
+                     "end_ms": 1_334_000, "text": "永远不会再醒来"}]},
+            }, ensure_ascii=False), encoding="utf-8")
+            norms = av_understand_module._load_subtitle_norms(str(ws))
+        norm = av_understand_module._norm_text
+        self.assertIn(norm("你终于来了"), norms)
+        self.assertIn(norm("永远不会再醒来"), norms)
+
+    # --- OP/ED scene vs the splice coverage contract -----------------------
+    @staticmethod
+    def _op_ed_ws(ws: Path, dialogues, schema="vts-av-notes/v2"):
+        visual = ws / ".cache" / "visual"
+        visual.mkdir(parents=True)
+        (ws / ".cache" / "alignment").mkdir(parents=True)
+        (visual / "scenes.json").write_text(json.dumps({"scenes": [{
+            "scene_id": "SCENE_01", "macro_index": 1, "start_ms": 84_000, "end_ms": 106_500,
+            "start_timecode": "00:01:24.000", "end_timecode": "00:01:46.500",
+            "duration_ms": 22_500, "slugline": "OP", "child_shot_count": 2,
+        }]}, ensure_ascii=False), encoding="utf-8")
+        (visual / "shots.json").write_text(json.dumps({"scenes": []}), encoding="utf-8")
+        (ws / ".cache" / "alignment" / "aligned_timeline.json").write_text(json.dumps({
+            "shots": [{"shot_id": "SCENE_01", "dialogues": dialogues}]}), encoding="utf-8")
+        (visual / "av_notes.json").write_text(json.dumps(
+            {"schema": schema, "scene_notes": []}), encoding="utf-8")
+        (ws / "materials").mkdir()
+        (ws / "materials" / "bible.json").write_text(json.dumps({
+            "characters": [{"name": "菈菈"}],
+            "op_ed_windows": [{"start_ms": 84_000, "end_ms": 105_000, "label": "OP"}],
+        }, ensure_ascii=False), encoding="utf-8")
+
+    def test_op_ed_scene_with_surviving_line_is_not_stubbed(self):
+        """The scene is >50% inside the OP window, but one line straddles the edge and
+        survives. Stubbing it used to deadlock splice on a placeholder nobody was asked
+        to weave (the writer only handles draft_status == "missing")."""
+        from build_scene_manifest import build_manifest
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._op_ed_ws(ws, [{"sub_index": 1, "text": "喂，等等我", "start_ms": 104_900,
+                                 "end_ms": 105_400}])
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                manifest = build_manifest(ws, max_keyframes=4)
+            scene = manifest["scenes"][0]
+            self.assertEqual(scene["draft_status"], "missing")
+            self.assertEqual(scene["op_ed"], "OP")            # annotation survives
+            self.assertEqual(len(scene["dialogues"]), 1)
+            self.assertFalse((ws / ".cache" / "scene_drafts" / "scene_01.md").exists())
+            self.assertIn("[WARN]", err.getvalue())
+            self.assertIn("surviving dialogue", err.getvalue())
+
+    def test_op_ed_scene_without_lines_still_gets_a_stub(self):
+        from build_scene_manifest import build_manifest
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._op_ed_ws(ws, [])
+            with contextlib.redirect_stderr(io.StringIO()):
+                manifest = build_manifest(ws, max_keyframes=4)
+            scene = manifest["scenes"][0]
+            self.assertEqual(scene["draft_status"], "op_ed")
+            self.assertEqual(scene["keyframes_thumbs"], [])
+            stub = (ws / ".cache" / "scene_drafts" / "scene_01.md").read_text(encoding="utf-8")
+            self.assertIn("（动画 OP——按配置略）", stub)
+            self.assertNotIn("[[SUB:", stub)
+
+    def test_stale_av_notes_schema_is_reported(self):
+        from build_scene_manifest import build_manifest
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            self._op_ed_ws(ws, [], schema="vts-av-notes/v1")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                build_manifest(ws, max_keyframes=4)
+            self.assertIn("vts-av-notes/v1", err.getvalue())
+            self.assertIn("vts-av-notes/v2", err.getvalue())
+
+    def test_manifest_schema_constant_matches_the_producer(self):
+        import build_scene_manifest
+        self.assertEqual(build_scene_manifest.EXPECTED_AV_NOTES_SCHEMA,
+                         av_understand_module.AV_NOTES_SCHEMA)
+
+
 if __name__ == "__main__":
     unittest.main()

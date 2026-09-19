@@ -87,16 +87,22 @@ def filter_items(items: List[Dict[str, Any]], windows: List[Dict[str, Any]]) -> 
         return items, {}
     kept: List[Dict[str, Any]] = []
     removed: Dict[str, int] = {}
+    removed_lines: List[Dict[str, Any]] = []
     for item in items:
         start = int(item.get("start_ms", 0))
         end = int(item.get("end_ms", start))
         label = matching_label(start, max(end, start + 1), windows, threshold=0.5)
         if label:
             removed[label] = removed.get(label, 0) + 1
+            removed_lines.append({"original_index": item.get("index"), "label": label,
+                                  "start_ms": start, "end_ms": max(end, start + 1),
+                                  "text": str(item.get("text") or "")})
         else:
             kept.append(item)
     for i, item in enumerate(kept, start=1):
         item["index"] = i
+    # The dropped lines stay in the record: counts alone cannot be audited or undone,
+    # and they are the reference set for the hard-subtitle echo check at merge.
     meta = {"windows": [dict(w) for w in windows], "removed": removed,
-            "removed_total": sum(removed.values())}
+            "removed_total": sum(removed.values()), "removed_lines": removed_lines}
     return kept, meta

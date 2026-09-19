@@ -312,7 +312,7 @@
   keeps boundary-straddling dialogue on the narrative side. No config = old behaviour everywhere.
 - **AV-pass hardening** (the review's P1-P3):
   - plan_segments: the 45 s tail fold let segments balloon to 134 s against three documents
-    promising ≤90 s — fold is now capped at +10 s (91 s scene = one segment; 200 s = 90/90/20);
+    promising ≤90 s — fold is now capped at +10 s (91 s scene = one segment; 200 s = 90/90/30);
   - coverage now measures evidence, not cuts: an empty {'raw': {}} note used to pass the resume
     gate forever and keep scenes at a fictional 100% — substance gate + per-segment counts make
     the SKILL's fallback path actually reachable;
@@ -329,3 +329,42 @@
 - **Tests**: +16 (window config/thresholds/reindex, plan cap + fold exception, alias/time-string
   parsing, substance gate, dedup, part shape, no-rebill, real-ffmpeg fit ladder + orphan cleanup,
   and a no-network prepare→cut→merge E2E leg) — **189 green**.
+
+## 14. v0.5.2 — OP/ED × splice Contract Fix + AV-Pass Side-Effect Cleanup + Egress Declaration
+
+- **Trigger**: a second external review of v0.5.1 verified that the fold cap, coverage, alias parsing,
+  repair-round removal, ladder cleanup and stdout summary all landed — and found one blocker the
+  OP/ED feature introduced plus four side effects. It also asked where the Qwen3.8-Omni dependency
+  and the API-key protection are *declared*, not just implemented.
+- **P1 OP/ED stub deadlocked the splice contract**: a scene sitting >50% inside a window is labelled
+  `op_ed` and gets a self-written stub, but a dialogue line straddling the window edge survives
+  (it is <=50% inside) and stays in that scene's `dialogues`. The writer only handles
+  `draft_status == "missing"`, so the placeholder was never authored and splice aborted the whole
+  episode with "missing 1 dialogue placeholder". Now a stub requires the scene to hold **no**
+  surviving lines; otherwise the scene is authored normally with the `op_ed` annotation kept, and the
+  builder WARNs. Verified on both refs with the same fixture: main → `op_ed` + splice FATAL; this
+  branch → `missing` + the same scene assembling.
+- **AV-pass side effects**: `dedup_entries` used to extend the span of a dict already committed to an
+  earlier segment, so a segment's list could stop describing what that segment returned — the pool
+  now holds its own copies (emitted rows never mutate; chains still merge against the widest span).
+  The resume gate parsed candidates with a synthetic 1-second span, which read a real note whose only
+  evidence starts at 5 s as empty and re-billed a paid video call on every `run`; it is now a
+  shape-only test on the raw reply. `op_ed_filtered` recorded counts only — the dropped lines' text is
+  kept now, which also feeds the hard-subtitle echo check that previously could not see ED lyrics the
+  filter had already removed. A stale `av_notes.json` schema is reported instead of consumed silently.
+- **Egress declaration** (`scripts/config_spec.py` as the single source, `SECURITY.md` as the prose):
+  SKILL frontmatter now discloses before activation that two Omni passes upload 16 kHz audio parts and
+  ≤90 s video segments to DashScope and that `DASHSCOPE_BASE_URL` decides who receives the key; both
+  READMEs gained the full variable table (`DASHSCOPE_API_KEY`, `DASHSCOPE_BASE_URL`, `V2S_OMNI_MODEL`,
+  `V2S_OMNI_ATTEMPTS`, `V2S_OMNI_TIMEOUT_SEC`) and stop describing the key as diarization-only.
+  Newly test-pinned: the key is read in exactly one module, `omni_client.meta` is a declared key
+  allowlist that carries no credential, documents agree with `config_spec` defaults, and the
+  secret-shape scan covers Markdown too and is driven by `SECRET_PATTERNS`.
+- **Docs vs artifacts**: the fold example in the `plan_segments` docstring and EVOLUTION ## 13 said
+  200 s → 90/90/20; measured it is 90/90/30. README's "≤90 s segments" now carries the +10 s exception.
+  Two dead imports in `av_understand.py` (`EXIT_MISSING_FFMPEG`, `load_subtitle_items`) came in with
+  v0.5.1 and would have failed the CI `syntax` leg (`ruff --select F`) on the first push — v0.5.1 was
+  never pushed, so nothing had reported it. Removed.
+- **Tests**: +16 (10 contract regressions, 6 credential/egress invariants; 8 of the 10 contract ones
+  fail on main by design) — **205 green**, and `test_end_to_end` still drives all five stages on a real
+  ffmpeg episode.

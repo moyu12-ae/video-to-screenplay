@@ -12,12 +12,28 @@
 2. 导出环境变量：`export DASHSCOPE_API_KEY="sk-..."`；
 3. （可选）指向其他 OpenAI 兼容端点：`export DASHSCOPE_BASE_URL="https://..."`。
 
-该 Key 用于 Qwen3.8-Omni 声学说话人分离。阶段 1 会做前置检查：未配置时流水线会显式询问——配置 Key 后重跑，或明确选择"说话人列留空"继续（`speaker_diarize.py run` 以退出码 8 二次拦截）。
+该 Key 同时支撑两处 Qwen3.8-Omni 能力：声学说话人分离，以及可选的声画理解 pass。阶段 1 会做前置检查：未配置时流水线会显式询问——配置 Key 后重跑，或明确选择"说话人列留空"继续（`speaker_diarize.py run` 以退出码 8 二次拦截）。
+
+### 什么会离开你的机器（以及 Key 会发往何处）
+
+本插件会把素材上传给第三方 API。完整声明见 `SECURITY.md`；`scripts/config_spec.py` 是机器可读的唯一事实源，文档与它漂移时测试会失败。
+
+| 环境变量 | 默认值 | 控制什么 |
+| :--- | :--- | :--- |
+| `DASHSCOPE_API_KEY` | 未设置 | 两处 Omni pass 的 Bearer 凭据；全仓库只在一处函数读取，绝不落盘、绝不进日志 |
+| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | **哪个主机接收 key 与媒体**（强制 https + 公网地址） |
+| `V2S_OMNI_MODEL` | `qwen3.8-omni-flash` | 用哪个全模态模型解读你的画面 |
+| `V2S_OMNI_ATTEMPTS` | `3` | 单次请求的重试预算（仅限瞬时错误） |
+| `V2S_OMNI_TIMEOUT_SEC` | `1800` | 单个流式请求的墙钟上限 |
+
+会上传：16 kHz 单声道音频分片（声学分离）、逐场 ≤90 秒 480p 含单声道音轨的视频段（声画理解）。
+不会作为转写内容上传：台词——字幕在本地解析并逐字拼装，AV prompt 明令禁止转写对白。
+`workspace.py doctor` 在报告 key 状态的同时报告它将去往的主机与所用模型。
 
 ## 工作原理
 
 1. **纯净三层工作区** —— `materials/`（只读输入）→ `.cache/`（可随时清空的中间产物）→ `output/`（只放最终剧本）。
-2. **字幕门禁** —— 外挂字幕 → 容器内封软字幕 → OCR 档。只有 OCR 能服务时，提取器把 Tier 3 指令打到 stdout 并以**退出码 6**（等待感知阶段）结束——这是**出路，不是拒止**；只有在用户确认素材真的无对白之后，才由 `workspace.py check-subtitles --mode none` 以退出码 5 硬性拒止。绝不凭空捏造台词。 配置 OP/ED 窗口（bible.json → `op_ed_windows`）后，片头/片尾歌词在提取时即被过滤——成稿只留一行（动画 OP/ED）标注。
+2. **字幕门禁** —— 外挂字幕 → 容器内封软字幕 → OCR 档。只有 OCR 能服务时，提取器把 Tier 3 指令打到 stdout 并以**退出码 6**（等待感知阶段）结束——这是**出路，不是拒止**；只有在用户确认素材真的无对白之后，才由 `workspace.py check-subtitles --mode none` 以退出码 5 硬性拒止。绝不凭空捏造台词。 配置 OP/ED 窗口（bible.json → `op_ed_windows`）后，片头/片尾歌词在提取时即被过滤——成稿只留一行（动画 OP/ED）标注；若某场落在窗口内却仍留有压边台词，它按普通场景撰写（stub 装不下 `[[SUB:n]]`），并同样加上这一行标注。
 3. **音画双轨并行** —— FFmpeg 切镜与关键帧提取，和字幕提取、**声学说话人分离**（ffmpeg 抽 16k 单声道音频 → 直连客户端流式调用同一个 Qwen3.8-Omni 分离请求——代码化重试/退避、逐片断点续跑、无客户端工具窗口限制；MCP `omni_multi_speaker_asr` 保留为回退 → 按声学簇**累计重叠**绑定到字幕行，故一条台词上覆盖 ≥40% 的第二声源会记入 `secondary_speaker`）并发执行。多分片时切点吸附静音、相邻片重叠 ±3 秒，跨片身份只认"重叠区同段语音"的共现证据（union-find 对齐，宁拆不并）；**归属 100% 归声学**，字幕元数据只给声学簇投票起名。模型报告某片「无人声」时该片记为已完成，重跑只补缺、不会为同一片段重复计费。**归属 100% 归声学**；没有 API key（也没有 MCP 回退）时说话人全 null 降级，流水线不阻塞，且降级产物会自报底细（`acoustic_clustering_enabled: false`、`backend: "none"`）。
 4. **LGSS 思想场景聚类** —— 一维 DP 求解器把 200+ 物理切镜折叠为宏场景。对白穿越的剪切点施加**大额软惩罚**（绝非硬禁止——求解器不可能死锁成"整集一场"，任何被迫切口都会显式上报）。安装 numpy/opencv 后，启用关键帧 HSV 调色板距离（LGSS "place" 模态的轻量代理，理念源自 LGSS, CVPR 2020）锐化边界；未安装则优雅降级为静默/时长启发式。
 5. **毫秒级对齐** —— 每条台词按最大时间重叠唯一归属到一个镜头；达不到重叠门槛的台词不会被丢弃，而是绑定到时间上最近的镜头并上报（对齐器因此绝不可能把「没人被要求放置」的字幕丢给拼装器），并标注 `ON_SCREEN` / `OFF_SCREEN` / `VOICE_OVER` / `INTERNAL_MONOLOGUE`。

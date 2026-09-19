@@ -43,12 +43,10 @@ import op_ed
 from speaker_diarize import (
     EXIT_BAD_INPUT,
     EXIT_EXTRACT_FAILED,
-    EXIT_MISSING_FFMPEG,
     EXIT_MISSING_KEY,
     EXIT_OK,
     EXIT_OMNI_OUTPUT_INVALID,
     _norm_text,
-    load_subtitle_items,
     locate_video,
     require_binaries,
 )
@@ -109,8 +107,9 @@ def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_
     overlap_sec shared between consecutive windows of the SAME scene. A tail
     shorter than AV_FOLD_TAIL_SEC folds into the last window instead of
     spawning a sliver that would cost a full API call - that one window may
-    then run up to segment_sec + AV_FOLD_TAIL_SEC (documented exception;
-    200 s -> [90, 90, 20] with the old 45 s fold was the bug). Segments never
+    then run up to segment_sec + AV_FOLD_TAIL_SEC (documented exception).
+    Measured: 200 s -> [90, 90, 30], 91 s -> [91]; the pre-0.5.1 45 s fold let
+    200 s plan as [90, 115], which three documents contradicted. Segments never
     cross scene boundaries. Pure; deterministic."""
     segments: List[Dict[str, Any]] = []
     ov = int(overlap_sec * 1000)
@@ -261,15 +260,17 @@ def has_substance(note: Dict[str, Any]) -> bool:
                 or note.get("uncertain"))
 
 
-def dedup_entries(entries: List[Dict[str, Any]], previous: List[Dict[str, Any]],
+def dedup_entries(entries: List[Dict[str, Any]], pool: List[Dict[str, Any]],
                   text_key: str = "what", ratio: float = 0.86,
                   time_gap_ms: int = 1500) -> List[Dict[str, Any]]:
     """Overlap-zone deduplication across segment boundaries - the official
     _deduplicate_events idea: an entry is dropped when a previously kept one
     matches on normalized text (SequenceMatcher >= ratio) AND the two windows
-    overlap or start within time_gap_ms; the earlier entry's span is extended
-    to cover the duplicate. Pure; preserves order."""
-    pool = list(previous)
+    overlap or start within time_gap_ms. Pure; preserves order.
+    `pool` is the caller's scene-level matching state: this function appends its own
+    COPIES and extends those copies' spans, so rows already emitted for an earlier
+    segment never change - each segment's list keeps stating what THAT segment
+    returned, while a triple-overlap chain still merges against the widest span."""
     out: List[Dict[str, Any]] = []
     for e in entries:
         sig = _norm_text(f"{e.get('who') or ''} {e.get(text_key) or ''}")
@@ -284,10 +285,10 @@ def dedup_entries(entries: List[Dict[str, Any]], previous: List[Dict[str, Any]],
                     dup = p
                     break
         if dup is not None:
-            dup["end"] = max(dup["end"], e["end"])
+            dup["end"] = max(dup["end"], e["end"])   # pool copy only
             continue
-        out.append(e)
-        pool.append(e)
+        out.append(dict(e))
+        pool.append(dict(e))
     return out
 
 
@@ -452,6 +453,29 @@ def _workorder(ws: Optional[str]) -> Tuple[Path, Dict[str, Any]]:
     return av_dir, work
 
 
+def _raw_has_substance(raw: Any) -> bool:
+    """Shape-only substance test on the RAW reply, for the resume gate. Deliberately
+    free of timeline math: parsing with a synthetic span would drop every entry that
+    starts past it and mistake a real note for an empty one - which then re-bills a
+    full video call on every `run`."""
+    if not isinstance(raw, dict):
+        return False
+    visual = raw.get("visual") if isinstance(raw.get("visual"), dict) else {}
+    acoustic = raw.get("acoustic") if isinstance(raw.get("acoustic"), dict) else {}
+
+    def filled(value: Any) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, list):
+            return any(filled(v) for v in value)
+        return bool(value)
+
+    return bool(filled(visual.get("caption")) or filled(visual.get("actions"))
+                or filled(visual.get("camera")) or filled(raw.get("visible_text"))
+                or filled(acoustic.get("events")) or filled(acoustic.get("music_mood"))
+                or filled(raw.get("uncertain")))
+
+
 def _is_valid_note(pth: Path) -> bool:
     """A saved note is resume-valid only when it parses AND carries actual
     evidence substance - {'raw': {}} used to count as done forever, keeping a
@@ -460,8 +484,10 @@ def _is_valid_note(pth: Path) -> bool:
         loaded = json.loads(pth.read_text(encoding="utf-8"))
     except Exception:
         return False
-    raw = loaded.get("raw") if isinstance(loaded, dict) and isinstance(loaded.get("raw"), dict) else loaded
-    return isinstance(raw, dict) and has_substance(parse_note(raw, 0, 1000))
+    if not isinstance(loaded, dict):
+        return False
+    raw = loaded.get("raw") if isinstance(loaded.get("raw"), dict) else loaded
+    return _raw_has_substance(raw)
 
 
 def cmd_run(ws: Optional[str], force: bool = False) -> None:
@@ -605,10 +631,6 @@ def cmd_merge(ws: Optional[str]) -> None:
                 norm = _norm_text(v.get("text", ""))
                 if norm and norm in subtitle_norms:
                     dup_subtitles += 1
-            prev["actions"].extend(acts)
-            prev["camera"].extend(cams)
-            prev["visible_text"].extend(vts)
-            prev["acoustic_events"].extend(evs)
             totals["actions"] += len(acts)
             totals["visible_text"] += len(vts)
             totals["acoustic_events"] += len(evs)
@@ -659,7 +681,9 @@ def cmd_merge(ws: Optional[str]) -> None:
 
 def _load_subtitle_norms(ws: Optional[str]) -> set:
     """Normalized subtitle texts for the visible-text duplication WARN (a
-    hard-subbed source makes visible_text echo the dialogue)."""
+    hard-subbed source makes visible_text echo the dialogue). OP/ED-filtered
+    lines count too: on a hard-subbed ED the echo is exactly what the filter
+    removed upstream, and it still must not reach the screenplay as text."""
     try:
         path = (Path(ws, ".cache", "subtitles", "extracted.json") if ws
                 else Path(".cache", "subtitles", "extracted.json"))
@@ -667,8 +691,13 @@ def _load_subtitle_norms(ws: Optional[str]) -> set:
             return set()
         doc = json.loads(path.read_text(encoding="utf-8"))
         items = doc.get("items") if isinstance(doc, dict) else doc
-        return {_norm_text(str(it.get("text", ""))) for it in (items or [])
-                if isinstance(it, dict)} - {""}
+        texts = [str(it.get("text", "")) for it in (items or []) if isinstance(it, dict)]
+        if isinstance(doc, dict):
+            filtered = doc.get("op_ed_filtered")
+            if isinstance(filtered, dict):
+                texts += [str(line.get("text", "")) for line in (filtered.get("removed_lines") or [])
+                          if isinstance(line, dict)]
+        return {_norm_text(t) for t in texts} - {""}
     except Exception:  # noqa: BLE001 - the gate is advisory
         return set()
 

@@ -1,6 +1,6 @@
 ---
 name: video-to-screenplay
-description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门与 API key 前置检查门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、可选声画理解 pass（Omni 看视频产出动作/镜头/声学/屏显文字证据）、多模态场景理解 pass，以及毫秒级时间线对齐。当用户提供视频素材或要求逆向还原剧本时使用。
+description: 将动漫、电影或电视剧视频转化为制作级中文场号制剧本。采用干净工作区协议（materials/ → .cache/ → output/）、前置字幕决策门与 API key 前置检查门、FFmpeg 场景切点关键帧提取、Qwen3.8-Omni 声学说话人分离（run 直连 DashScope，MCP omni_multi_speaker_asr 回退，均不可用时全 null 降级）、LGSS 式动态规划场景分组（含关键帧色板亲和度）、可选声画理解 pass（Omni 看视频产出动作/镜头/声学/屏显文字证据）、多模态场景理解 pass，以及毫秒级时间线对齐。数据外发声明：两处 Qwen3.8-Omni 能力需要 DASHSCOPE_API_KEY，会把 16kHz 音频分片与 ≤90 秒视频段上传至 DashScope（默认 dashscope.aliyuncs.com，可经 DASHSCOPE_BASE_URL 改变——启用前必须按 SECURITY.md 向用户披露并获得确认）；台词只来自字幕，模型输出绝不作为台词文本。当用户提供视频素材或要求逆向还原剧本时使用。
 ---
 
 # 视频转剧本流水线（`video-to-screenplay`）
@@ -86,7 +86,7 @@ python3 scripts/workspace.py doctor
   {"op_ed_windows": [{"start_ms": 84000, "end_ms": 105000, "label": "OP"},
                      {"start_ms": 1320000, "end_ms": 1440000, "label": "ED"}]}
   ```
-  配置后：字幕行在提取时即被过滤（`extracted.json` 记录 `op_ed_filtered` 明细，存活行重编号保持 [[SUB:n]] 连续）、声学分离丢弃窗口内语音段（歌手不再混入角色表）、声画理解跳过窗口内场景（每集省 2-3 次调用）、manifest 把窗口内场景标为 `op_ed` 并写好单行 stub——成稿在相应位置只出现一行 **（动画 OP）/（动画 ED）**。不配置 = 行为与旧版完全一致。
+  配置后：字幕行在提取时即被过滤（`extracted.json` 记录 `op_ed_filtered` 明细含**逐条被删文本**，存活行重编号保持 [[SUB:n]] 连续）、声学分离丢弃窗口内语音段（歌手不再混入角色表）、声画理解跳过窗口内场景（每集省 2-3 次调用）、manifest 把窗口内**且无幸存台词**的场景标为 `op_ed` 并写好单行 stub——成稿在相应位置只出现一行 **（动画 OP）/（动画 ED）**。若某场落在窗口内却留有压边台词（该台词过半在窗口外，故存活），它按普通场景撰写并带 `op_ed` 注记（stub 装不下 `[[SUB:n]]`，强行 stub 会让拼装致命退出）。不配置 = 行为与旧版完全一致。
 
 probe 会报告 `ffprobe_available`、外部字幕文件与内嵌字幕流。随后通过 `AskUserQuestion` 询问用户：
 - **外挂字幕**（一级）：在 `materials/` 中检出 `.srt`/`.ass`。
@@ -196,7 +196,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 - 场头规范化：每场 H2 统一为 `## 场 N【标题】（起 - 止）`——标题保留写作阶段起的名字，时间码从 scene_manifest 确定性注入；遗留的 `> 概要：` 引用行会被剥离。
 - 校验覆盖：缺失、重复、错位或孤儿的占位符都是**致命**错误，并点名出错的下标；说话人名单 lint 对 bible/manifest/通用角色词之外的名字告警。制作专属的描述性称呼（如「面试的店主」）写进 `materials/bible.json` 的 `"speaker_whitelist": [...]` 数组即可消除告警——插件内置白名单只含通用角色词，绝不烧入单部作品的词汇。
 - 组装整集文档：元数据头（字幕来源、镜头/场景计数）、场次总表、拼装后的各场、附录（声画关系统计 + 保真报告）。
-- 输出：`output/<标题>_影视文学剧本.md`。配置了 OP/ED 窗口时，成稿在相应位置只含一行 **（动画 OP）/（动画 ED）** 标注，保真报告记录被过滤的行数与窗口明细。
+- 输出：`output/<标题>_影视文学剧本.md`。配置了 OP/ED 窗口时，成稿在相应位置只含一行 **（动画 OP）/（动画 ED）** 标注（窗口内仍留有压边台词的场按普通场景撰写，并在场头下方加同一行标注），保真报告记录被过滤的行数与窗口明细。
 - 🛑 **停下复查**：splice 退出码 0 且 `dialogue_spliced == dialogue_total`；确认所有 lint 告警已知晓；交付物在 `output/`，项目根目录无散落文件，最终 `.md` 中零 `SPEAKER_` 字符串。
 
 ---
