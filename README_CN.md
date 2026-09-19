@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-一个 ZCode 插件：把长视频与番剧逆向还原为标准亚洲场号制影视剧本。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（由流水线自身直连 DashScope 完成——`speaker_diarize.py run`；MCP 工具 `omni_multi_speaker_asr` 作回退；未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
+一个 **Claude Code 插件**：把长视频与番剧逆向还原为标准亚洲场号制影视剧本——同一个仓库打包给三种 agent 宿主（Claude Code 原生走 `.claude-plugin/`，另附 ZCode 与 Qoder 适配）。确定性 Python 阶段负责一切可测量的计算（切镜、时间码、台词对齐）；感知型任务统一交给通用多模态大模型——场景理解（地点、时辰、出场人物、场面调度）由 agent 本身逐场完成，说话人归属由 **Qwen3.8-Omni 按音色声学聚类**（由流水线自身直连 DashScope 完成——`speaker_diarize.py run`；MCP 工具 `omni_multi_speaker_asr` 作回退；未配置时优雅降级为全部未归属）完成。台词文本永远只来自字幕、经 `[[SUB:n]]` 占位符逐字拼装——声学与 OCR 都不碰台词文本本身。
 
 ## ⚠️ 使用前必须配置阿里云 API Key
 
@@ -46,12 +46,33 @@
 
 - Python 3.10+
 - PATH 上有 FFmpeg / ffprobe（`brew install ffmpeg`）
-- 推荐：环境变量 `DASHSCOPE_API_KEY`——启用直连 API 的 Qwen3.8-Omni 声学说话人分离（`speaker_diarize.py run`：无客户端工具窗口限制、指数退避重试、逐片断点续跑）。回退：[Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 `api` 插件（MCP）。两者皆无时说话人列留空，流水线照常运行
+- 推荐：环境变量 `DASHSCOPE_API_KEY`——同时启用两处直连 API 的 Qwen3.8-Omni 能力：声学说话人分离（`speaker_diarize.py run`：无客户端工具窗口限制、指数退避重试、逐片断点续跑）与可选声画理解（`av_understand.py run`）。分离的回退方案：[Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) 的 `api` 插件（MCP）。两者皆无时说话人列留空，流水线照常运行
 - 可选：`pip install -r requirements.txt`（numpy + opencv-python-headless）——启用场景聚类的视觉 place 亲和度。其余全部纯标准库。
 
 ## 使用
 
-在 ZCode 内运行技能：
+### 按宿主安装
+
+一个仓库、三份宿主清单——技能正文、脚本与写作合同完全共用，只有清单按宿主不同。`tests/test_packaging.py`
+钉住三份清单的 name/version 一致。
+
+| 宿主 | 清单 | 安装方式 |
+| :--- | :--- | :--- |
+| Claude Code | `.claude-plugin/plugin.json` + `marketplace.json` | `/plugins` → 把本仓库添加为市场（`moyu12-ae/video-to-screenplay`）后安装 |
+| ZCode | `.zcode-plugin/plugin.json` | 同以往，从本仓库安装 |
+| Qoder | `.qoder-plugin/plugin.json` | 添加市场安装，或本地安装包。⚠️ **本地手动**路线（把包放到 `~/.qoder-cn/plugins`，并在 `installed_plugins_v2.json` 与 `enabledPlugins` 注册启用）**我们尚未端到端实测**，在验证前请当作未验证路径 |
+
+### 宿主内使用
+
+技能会在任何"把这个视频逆向成剧本"的请求下激活。三个命令对应流水线的自然续跑边界：
+
+```
+/video-to-screenplay:init      # 工作区 + 环境与 API key 前置检查 + 字幕决策门
+/video-to-screenplay:build     # 阶段 2-4：双轨提取、分组、对齐、证据包、逐场撰写
+/video-to-screenplay:splice    # 阶段 5：逐字拼装 + 交付复查清单
+```
+
+或直接运行技能：
 
 ```
 /video-to-screenplay

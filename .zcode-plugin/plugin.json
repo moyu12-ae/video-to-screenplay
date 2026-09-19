@@ -1,12 +1,12 @@
 {
   "name": "video-to-screenplay",
-  "description": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for Qwen3.8-Omni acoustic speaker diarization.",
+  "description": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for the two Qwen3.8-Omni passes: acoustic speaker diarization and optional audio-visual scene understanding (see SECURITY.md).",
   "description_i18n": {
-    "en": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for Qwen3.8-Omni acoustic speaker diarization.",
-    "zh-CN": "工业级全独立长视频与番剧逆向影视剧本流水线，具备三层沙盒工作区隔离、剧作圣经关系图谱自举、LGSS DP语义场景聚类及标准好莱坞/场号制排版输出。需配置阿里云 DashScope API Key（DASHSCOPE_API_KEY）以启用 Qwen3.8-Omni 声学说话人分离。"
+    "en": "Standalone industrial pipeline for reverse-engineering videos and anime episodes into production-standard screenplays with clean workspace isolation, series bible knowledge graphs, and semantic scene clustering. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for the two Qwen3.8-Omni passes: acoustic speaker diarization and optional audio-visual scene understanding (see SECURITY.md).",
+    "zh-CN": "工业级全独立长视频与番剧逆向影视剧本流水线，具备三层沙盒工作区隔离、剧作圣经关系图谱自举、LGSS DP语义场景聚类及标准好莱坞/场号制排版输出。需配置阿里云 DashScope API Key（DASHSCOPE_API_KEY）以启用 Qwen3.8-Omni 的两处全模态能力：声学说话人分离与可选声画理解（详见 SECURITY.md）。"
   },
-  "version": "0.5.2",
-  "author": "ZCode",
+  "version": "0.5.3",
+  "author": "moyu12-ae",
   "keywords": [
     "video",
     "screenplay",

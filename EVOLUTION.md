@@ -368,3 +368,35 @@
 - **Tests**: +16 (10 contract regressions, 6 credential/egress invariants; 8 of the 10 contract ones
   fail on main by design) — **205 green**, and `test_end_to_end` still drives all five stages on a real
   ffmpeg episode.
+
+## 15. v0.5.3 — Multi-Host Packaging: Claude Code first, ZCode and Qoder as adapters
+
+- **Trigger**: the repository self-described as "A ZCode plugin" although its native packaging is Claude
+  Code (`.claude-plugin/plugin.json` + a marketplace manifest), and the user wants it installed on Qoder.
+- **Contract research** (read from the six packages actually installed under
+  `~/.qoder-cn/plugins/cache/<marketId>/<name>/<version>`, not from docs): Qoder requires
+  `name`/`version`/`displayName`/`description`; capability pointers are `skills`, `commands`, `agents`,
+  `mcpServers`, `hooks`; `author` is an **object** (ZCode's is a string) and CN text uses
+  `descriptionZh` (ZCode uses a `description_i18n` map). Its skill frontmatter asks for `name` +
+  `description` — identical to what this repo already ships — and commands are `commands/*.md` with
+  `description` + `argument-hint`.
+- **Adaptation is manifest-level, not content-level**: `.qoder-plugin/plugin.json` added (with the egress
+  fact in its description: two Omni passes, audio segments and short video clips uploaded, see
+  SECURITY.md), plus three façade commands — `init` / `build` / `splice` — that map onto the pipeline's
+  natural resume boundaries and defer every rule to SKILL.md instead of restating it. No script, no
+  SKILL body, no writing contract changed. `.mcp.json` deliberately NOT declared: the plugin ships no
+  MCP server and the `omni_multi_speaker_asr` fallback belongs to Qwen-MM-Plugins — pointing a vendored
+  dependency at someone else's package is not ours to do.
+- **Facts corrected**: `.zcode-plugin/plugin.json` credited `"author": "ZCode"` — the work is
+  moyu12-ae's, and all three manifests now must say so under test. All manifest descriptions said the
+  DashScope key powers *diarization only*; it powers two Qwen3.8-Omni passes (README requirements bullet
+  had the same drift).
+- **Anti-drift**: `TestMultiHostPackaging` pins identical plugin names, per-host required fields, that
+  every declared `skills`/`commands` pointer resolves to a real directory holding real files, command
+  frontmatter, author ≠ host name, and that every manifest names the credential it needs. The existing
+  version probe now covers four manifests (it failed the moment these were bumped past the EVOLUTION
+  record, which is the guard working).
+- **Not claimed**: the Qoder *manual local install* route (write into `~/.qoder-cn/plugins` +
+  `installed_plugins_v2.json` + `enabledPlugins`) is documented in the README as **unverified**; it
+  edits live application config and needs its own end-to-end experiment before being presented as fact.
+- **Tests**: +6 — **211 green**, ruff `--select F` clean.

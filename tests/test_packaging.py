@@ -49,6 +49,7 @@ class TestPluginManifests(unittest.TestCase):
         versions = {
             ".claude-plugin/plugin.json": _load(".claude-plugin/plugin.json")["version"],
             ".zcode-plugin/plugin.json": _load(".zcode-plugin/plugin.json")["version"],
+            ".qoder-plugin/plugin.json": _load(".qoder-plugin/plugin.json")["version"],
             ".claude-plugin/marketplace.json": _load(".claude-plugin/marketplace.json")
             ["plugins"][0]["version"],
             ".claude-plugin/marketplace.json (metadata)": _load(
@@ -175,6 +176,76 @@ class TestEgressDeclaration(unittest.TestCase):
         header = skill.split("---", 2)[1]
         for needle in ("DASHSCOPE_API_KEY", "DASHSCOPE_BASE_URL", "SECURITY.md"):
             self.assertIn(needle, header, f"SKILL frontmatter must declare {needle}")
+
+
+HOST_MANIFESTS = {
+    "claude": ".claude-plugin/plugin.json",
+    "zcode": ".zcode-plugin/plugin.json",
+    "qoder": ".qoder-plugin/plugin.json",
+}
+
+
+class TestMultiHostPackaging(unittest.TestCase):
+    """One repository, three host manifests. Field shapes genuinely differ per host
+    (verified against the six packages installed under ~/.qoder-cn/plugins/cache and
+    against this repo's Claude/ZCode manifests), so each host is checked against ITS
+    OWN required set - not one guessed union."""
+
+    def test_plugin_name_is_identical_and_legal(self):
+        names = {_load(rel)["name"] for rel in HOST_MANIFESTS.values()}
+        self.assertEqual(names, {"video-to-screenplay"})
+        # Qoder's loader enforces this slug shape
+        self.assertRegex("video-to-screenplay", r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+    def test_qoder_required_fields_are_present(self):
+        """All six installed Qoder packages declare exactly these four."""
+        q = _load(".qoder-plugin/plugin.json")
+        for field in ("name", "version", "displayName", "description"):
+            self.assertTrue(str(q.get(field, "")).strip(), f"Qoder manifest needs {field}")
+
+    def test_declared_capability_paths_exist(self):
+        """A manifest pointer that resolves to nothing is how a plugin installs and
+        then shows zero skills - the same failure class as the v0.4.2 marketplace bug."""
+        for host, rel in HOST_MANIFESTS.items():
+            manifest = _load(rel)
+            declared = manifest.get("skills")
+            self.assertIsNotNone(declared, f"{host} manifest must declare skills")
+            for pointer in (declared if isinstance(declared, list) else [declared]):
+                target = (ROOT / pointer.strip("/"))
+                self.assertTrue(target.is_dir(), f"{host} skills pointer is dead: {pointer}")
+                self.assertTrue(list(target.glob("*/SKILL.md")), f"{host} has no SKILL.md under {pointer}")
+            commands = manifest.get("commands")
+            if commands:
+                cdir = ROOT / commands.strip("/")
+                self.assertTrue(cdir.is_dir(), f"{host} commands pointer is dead: {commands}")
+                self.assertTrue(list(cdir.glob("*.md")), f"{host} ships no command files")
+
+    def test_command_files_carry_frontmatter(self):
+        files = sorted((ROOT / "commands").glob("*.md"))
+        self.assertTrue(files, "commands/ must exist for the hosts that declare it")
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\n"), f"{path.name} needs frontmatter")
+            front = text.split("---", 2)[1]
+            fields = {line.split(":", 1)[0].strip() for line in front.splitlines() if ":" in line}
+            self.assertIn("description", fields, f"{path.name} needs a description")
+            self.assertIn("argument-hint", fields, f"{path.name} needs an argument-hint")
+
+    def test_no_host_is_credited_as_author(self):
+        """The ZCode manifest shipped with author "ZCode" - a plugin is authored by its
+        repository owner, never by the host that runs it."""
+        for host, rel in HOST_MANIFESTS.items():
+            author = _load(rel).get("author")
+            name = author.get("name") if isinstance(author, dict) else author
+            self.assertNotIn(str(name).strip().lower(), {"zcode", "qoder", "claude", "anthropic", "openai"},
+                             f"{rel} credits the host rather than the real author")
+            self.assertEqual(str(name), "moyu12-ae", f"{rel} must credit the repository owner")
+
+    def test_every_manifest_states_the_credential_it_needs(self):
+        for host, rel in HOST_MANIFESTS.items():
+            blob = json.dumps(_load(rel), ensure_ascii=False)
+            self.assertIn("DASHSCOPE_API_KEY", blob,
+                          f"{rel} must name the key the two Qwen3.8-Omni passes need")
 
 
 if __name__ == "__main__":

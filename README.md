@@ -2,7 +2,7 @@
 
 English | [简体中文](README_CN.md)
 
-A ZCode plugin that reverse-engineers videos and anime episodes into production-standard Asian 场号制 screenplays. Deterministic Python stages compute everything measurable (cuts, timecodes, dialogue alignment); perception is delegated to general multimodal models — scene understanding (place, time of day, characters, staging) is supplied by the agent itself, while speaker attribution comes from **Qwen3.8-Omni acoustic timbre clustering** (dialed directly from the pipeline via `speaker_diarize.py run`, with the MCP tool `omni_multi_speaker_asr` as a fallback, and degrading gracefully to fully-unattributed when unconfigured). Dialogue text always comes exclusively from subtitles via `[[SUB:n]]` verbatim splicing — acoustics and OCR never touch the dialogue text itself.
+A Claude Code plugin that reverse-engineers videos and anime episodes into production-standard Asian 场号制 screenplays — packaged for three agent hosts from one repository (Claude Code natively via `.claude-plugin/`, plus ZCode and Qoder adapters). Deterministic Python stages compute everything measurable (cuts, timecodes, dialogue alignment); perception is delegated to general multimodal models — scene understanding (place, time of day, characters, staging) is supplied by the agent itself, while speaker attribution comes from **Qwen3.8-Omni acoustic timbre clustering** (dialed directly from the pipeline via `speaker_diarize.py run`, with the MCP tool `omni_multi_speaker_asr` as a fallback, and degrading gracefully to fully-unattributed when unconfigured). Dialogue text always comes exclusively from subtitles via `[[SUB:n]]` verbatim splicing — acoustics and OCR never touch the dialogue text itself.
 
 ## ⚠️ Aliyun API Key Required
 
@@ -44,12 +44,34 @@ Uploaded: 16 kHz mono audio parts (diarization) and per-scene video segments of 
 
 - Python 3.10+
 - FFmpeg / ffprobe on PATH (`brew install ffmpeg`)
-- Recommended: `DASHSCOPE_API_KEY` in the environment — enables direct-API Qwen3.8-Omni acoustic speaker diarization (`speaker_diarize.py run`: no client tool-window limits, exponential-backoff retries, per-part resume). Fallback: the `api` plugin of [Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) (MCP). Without either, the speaker columns stay blank and the pipeline still runs
+- Recommended: `DASHSCOPE_API_KEY` in the environment — enables both direct-API Qwen3.8-Omni passes: acoustic speaker diarization (`speaker_diarize.py run`: no client tool-window limits, exponential-backoff retries, per-part resume) and optional audio-visual scene understanding (`av_understand.py run`). Fallback for diarization: the `api` plugin of [Qwen-MM-Plugins](https://github.com/QwenLM/Qwen-MM-Plugins) (MCP). Without either, the speaker columns stay blank and the pipeline still runs
 - Optional: `pip install -r requirements.txt` (numpy + opencv-python-headless) — enables the visual place affinity in the scene grouper. Everything else is pure standard library.
 
 ## Usage
 
-Run the skill inside ZCode:
+### Install per host
+
+One repository, three host manifests — the skill body, the scripts and the writing contract are shared;
+only the manifest differs per host. `tests/test_packaging.py` pins name/version consistency across them.
+
+| Host | Manifest | Install |
+| :--- | :--- | :--- |
+| Claude Code | `.claude-plugin/plugin.json` + `marketplace.json` | `/plugins` → add this repo as a marketplace (`moyu12-ae/video-to-screenplay`), then install |
+| ZCode | `.zcode-plugin/plugin.json` | install from this repo as before |
+| Qoder | `.qoder-plugin/plugin.json` | add the marketplace, or install the package locally. ⚠️ The **local/manual** route (placing the package under `~/.qoder-cn/plugins` and registering it in `installed_plugins_v2.json` + `enabledPlugins`) has **not been verified end-to-end by us yet** — treat it as untested until it is |
+
+### Inside the host
+
+The skill activates on any "reverse this video into a screenplay" request. Three commands map to the
+pipeline's natural resume boundaries:
+
+```
+/video-to-screenplay:init      # workspace + environment/key preflight + subtitle decision gate
+/video-to-screenplay:build     # stages 2-4: tracks, grouping, alignment, evidence packs, scene drafts
+/video-to-screenplay:splice    # stage 5: verbatim splice + delivery checklist
+```
+
+Or run the skill directly:
 
 ```
 /video-to-screenplay
