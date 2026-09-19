@@ -236,6 +236,13 @@
   failed MP3 fit tiers are unlinked, `V2S_OMNI_ATTEMPTS=0` surfaces its real error instead of
   "retry loop exhausted", container/subtitle extension sets are aligned across stages, and the
   dead imports an `ruff -F` pass turned up are gone.
+- **One version line**: the host manifests had drifted to `1.0.0` while the evolution record
+  was at v0.4.x. All four version fields (`.claude-plugin/plugin.json`,
+  `.zcode-plugin/plugin.json`, `marketplace.json` metadata + entry) are now `0.4.3`, and
+  `test_manifest_version_matches_the_evolution_record` pins them to whatever the newest
+  `## N. vX.Y.Z` section of this file says, so the number cannot drift again silently.
+  `test-prompts.json` keeps its own `1.3.0`: that versions the evaluation prompt corpus, not
+  the plugin.
 - **Distribution**: added the missing `.claude-plugin/plugin.json` (the marketplace advertised
   `"source": "./"` with no manifest behind it), `.github/workflows/ci.yml` (suite × {with,
   without} numpy/opencv on Linux + macOS, plus the `ruff -F` gate), and `tests/test_packaging.py`

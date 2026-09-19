@@ -47,8 +47,23 @@ class TestPluginManifests(unittest.TestCase):
             ".zcode-plugin/plugin.json": _load(".zcode-plugin/plugin.json")["version"],
             ".claude-plugin/marketplace.json": _load(".claude-plugin/marketplace.json")
             ["plugins"][0]["version"],
+            ".claude-plugin/marketplace.json (metadata)": _load(
+                ".claude-plugin/marketplace.json")["metadata"]["version"],
         }
         self.assertEqual(len(set(versions.values())), 1, versions)
+
+    def test_manifest_version_matches_the_evolution_record(self):
+        """The repo carries one version line: EVOLUTION.md's newest section is the
+        release, and the host manifests must say the same number. (They drifted to
+        1.0.0 while the record was at v0.4.x.)"""
+        evolution = (ROOT / "EVOLUTION.md").read_text(encoding="utf-8")
+        sections = re.findall(r"^##\s*\d+\.\s*v(\d+\.\d+\.\d+)", evolution, re.MULTILINE)
+        self.assertTrue(sections, "EVOLUTION.md must record a versioned section per release")
+        latest = sections[-1]
+        for rel in (".claude-plugin/plugin.json", ".zcode-plugin/plugin.json"):
+            self.assertEqual(_load(rel)["version"], latest,
+                             f"{rel} says {_load(rel)['version']} but EVOLUTION.md's "
+                             f"latest release is v{latest}")
 
     def test_skill_frontmatter_name_matches_plugin(self):
         skill = (ROOT / "skills" / "video-to-screenplay" / "SKILL.md").read_text(encoding="utf-8")

@@ -6,14 +6,14 @@
   },
   "metadata": {
     "description": "Marketplace for the video-to-screenplay plugin: reverse-engineer videos & anime into production-standard 场号制 screenplays.",
-    "version": "1.0.0"
+    "version": "0.4.3"
   },
   "plugins": [
     {
       "name": "video-to-screenplay",
       "source": "./",
       "description": "Standalone industrial pipeline that reverse-engineers videos and anime episodes into production-standard Chinese 场号制 screenplays: clean workspace isolation, FFmpeg shot cuts + keyframes, LGSS-style DP semantic scene clustering with an optional McKee sequence layer, and verbatim [[SUB:n]] placeholder splicing for guaranteed dialogue fidelity.",
-      "version": "1.0.0",
+      "version": "0.4.3",
       "keywords": [
         "video",
         "screenplay",
