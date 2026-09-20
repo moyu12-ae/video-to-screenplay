@@ -21,6 +21,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 import resolve_cast  # noqa: E402
 import series  # noqa: E402
+from av_understand import AV_NOTES_SCHEMA as AV_NOTES_SCHEMA_FIX  # noqa: E402
 
 APPROVED = {
     "schema": "vts-cast/v1",
@@ -225,7 +226,7 @@ class TestArtifactAndGuards(unittest.TestCase):
                                        "timbre": "bright"}}]}, ensure_ascii=False),
             encoding="utf-8")
         (ws / ".cache" / "visual" / "av_notes.json").write_text(json.dumps(
-            {"schema": "vts-av-notes/v2", "scene_notes": []}), encoding="utf-8")
+            {"schema": AV_NOTES_SCHEMA_FIX, "scene_notes": []}), encoding="utf-8")
         (ws / ".cache" / "alignment" / "aligned_timeline.json").write_text(json.dumps(
             {"shots": [{"shot_id": "SCENE_01", "dialogues": [
                 {"sub_index": 1, "text": "茉里 你交朋友了", "speaker": "SPEAKER_A1"}]}]},

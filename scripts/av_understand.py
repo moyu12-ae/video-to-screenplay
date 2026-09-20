@@ -56,12 +56,17 @@ AV_OVERLAP_SEC = 5.0           # between segments of the SAME scene only
 AV_FOLD_TAIL_SEC = 10.0        # a tail shorter than this folds into the last window,
                                # which may then run up to segment_sec + AV_FOLD_TAIL_SEC -
                                # otherwise a 5 s sliver would cost a full API call
-AV_NOTES_SCHEMA = "vts-av-notes/v3"  # v2 -> v3 adds per-action mouth_state (v0.6 P3)
+AV_NOTES_SCHEMA = "vts-av-notes/v4"  # v3 adds mouth_state; v4 adds mouth_motion # (the ep02 breakfast scene proved "mouth moving" alone conflates talking with chewing)
 # The three states the ASD channel may report. `unknown` is what an illegal or
 # absent value becomes - never a guess, and never folded into `still`, because
 # "mouth not moving" is weak evidence while "could not see the mouth" is no
 # evidence at all (§7's one-sided rule).
 MOUTH_STATES = ("moving", "still", "not_visible")
+# Measured reason this exists: in a 35s breakfast scene 5 of 10 "moving" actions were
+# explicitly chewing. Only `speaking` may count as speaker evidence; the others are
+# mouth motion with a different cause, and folding them in would silently poison the
+# one channel that is supposed to be high-precision.
+MOUTH_MOTIONS = ("speaking", "chewing", "yawning", "other", "not_applicable")
 MOUTH_COMPLIANCE_MIN = 0.80  # below this the channel is NOT usable (see §10 P3)
 AV_MOUTH_MAX_WINDOW_SEC = 3.0  # limited animation loops a mouth in ~0.5-1s; longer
 #                                 windows cannot localise who is talking, so the
@@ -89,12 +94,17 @@ HARD RULES:
   "still" (their mouth is visible and stays shut), "not_visible" (face turned away, off screen,
   too small, or they are not in frame). Never infer mouth_state from speech timing, subtitles, or
   context - if you cannot see it, write "not_visible".
+- When mouth_state is "moving", also say WHY the mouth moves: mouth_motion =
+  "speaking" (words come out), "chewing" (eating), "yawning", "other", or "not_applicable"
+  when mouth_state is "still" or "not_visible". A person eating is NOT a person talking.
 - Keep each action window at most 3 seconds: split a longer continuous action into consecutive
-  windows, each describing what changes.
+  windows, each describing what changes. Reaching the cap is required, not optional: an action
+  longer than 3 seconds must be split into consecutive <=3s windows.
 - Output ONLY one JSON object inside a ```json fence, exactly this shape:
 {"visual": {"caption": "<2-3 句中文，概括整段画面>",
    "actions": [{"start": <sec>, "end": <sec>, "who": "<描述性称呼>", "what": "<中文，具体可演的动作>",
-     "mouth_state": "<moving|still|not_visible>"}],
+     "mouth_state": "<moving|still|not_visible>",
+     "mouth_motion": "<speaking|chewing|yawning|other|not_applicable>"}],
    "camera": [{"start": <sec>, "end": <sec>, "movement": "<中文：景别/推拉摇移/手持/固定>"}],
    "scene_transition": "<中文：硬切/叠化/无>"},
  "visible_text": [{"start": <sec>, "end": <sec>, "text": "<屏显文字逐字>",
@@ -197,7 +207,7 @@ def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
     silently clamped into confident wrong timecodes. Never raises on bad data."""
     span_s = max(0.001, (end_ms - start_ms) / 1000.0)
     dropped: Dict[str, int] = {"actions": 0, "camera": 0, "visible_text": 0, "acoustic_events": 0,
-                               "mouth_state_invalid": 0}
+                               "mouth_state_invalid": 0, "mouth_motion_invalid": 0}
 
     def timed(entries: Any, who_names: Tuple[str, ...], what_names: Tuple[str, ...],
               channel: str, mouth: bool = False) -> List[Dict[str, Any]]:
@@ -223,8 +233,13 @@ def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
                 raw_state = _first(e, ("mouth_state", "mouth", "mouthState"))
                 state = str(raw_state or "").strip().lower()
                 row["mouth_state"] = state if state in MOUTH_STATES else "unknown"
+                raw_motion = _first(e, ("mouth_motion", "motion", "mouthMotion"))
+                motion = str(raw_motion or "").strip().lower()
+                row["mouth_motion"] = motion if motion in MOUTH_MOTIONS else "unknown"
                 if row["mouth_state"] == "unknown":
                     dropped["mouth_state_invalid"] = dropped.get("mouth_state_invalid", 0) + 1
+                if row["mouth_motion"] == "unknown":
+                    dropped["mouth_motion_invalid"] = dropped.get("mouth_motion_invalid", 0) + 1
             out.append(row)
         return out
 
@@ -603,6 +618,8 @@ def mouth_compliance(scene_notes: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     counts = {state: 0 for state in MOUTH_STATES}
     counts["unknown"] = 0
+    motions = {motion: 0 for motion in MOUTH_MOTIONS}
+    motions["unknown"] = 0
     total = over = 0
     for note in scene_notes:
         for seg in note.get("segments") or []:
@@ -610,6 +627,8 @@ def mouth_compliance(scene_notes: List[Dict[str, Any]]) -> Dict[str, Any]:
                 total += 1
                 state = str(action.get("mouth_state") or "unknown")
                 counts[state if state in counts else "unknown"] += 1
+                motions[str(action.get("mouth_motion") or "unknown") if
+                        str(action.get("mouth_motion") or "unknown") in motions else "unknown"] += 1
                 window_ms = int(action.get("end", 0)) - int(action.get("start", 0))
                 if window_ms > AV_MOUTH_MAX_WINDOW_SEC * 1000:
                     over += 1
@@ -617,6 +636,7 @@ def mouth_compliance(scene_notes: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "actions_total": total,
         "states": counts,
+        "motions": motions,
         "valid_rate": round(valid / total, 3) if total else 0.0,
         "windows_over_3s": over,
         "window_compliance": round((total - over) / total, 3) if total else 0.0,

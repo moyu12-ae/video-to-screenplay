@@ -149,7 +149,10 @@ def visual_evidence(av_doc: Any) -> Dict[str, Any]:
                 state = str(action.get("mouth_state") or "unknown")
                 if state in states_seen:
                     states_seen[state] += 1
-                if state == "moving" and str(action.get("who") or "").strip():
+                # Only mouth motion caused by SPEECH is speaker evidence; chewing
+                # is mouth motion too and was the majority of "moving" in ep02.
+                if state == "moving" and str(action.get("mouth_motion") or "") == "speaking" \
+                        and str(action.get("who") or "").strip():
                     who = str(action["who"]).strip()
                     positive[who] = positive.get(who, 0) + 1
     usable_channel = bool(compliance.get("usable")) if isinstance(compliance, dict) else False
@@ -189,7 +192,8 @@ def cluster_visual_votes(speakers_doc: Any, av_doc: Any) -> Dict[str, Dict[str, 
             continue
         t0, t1 = int(turn.get("start_ms", 0)), int(turn.get("end_ms", 0))
         for action in actions:
-            if str(action.get("mouth_state")) != "moving":
+            if str(action.get("mouth_state")) != "moving" \
+                    or str(action.get("mouth_motion") or "") != "speaking":
                 continue
             a0, a1 = int(action.get("start", 0)), int(action.get("end", 0))
             if min(t1, a1) - max(t0, a0) <= 0:
@@ -406,11 +410,19 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
                                          entity_of[s["slot_id"]] in ruled_out)]
     visual = ev["visual"]
     ac_counts, ac_unobserved = acoustic_distribution(cluster, eligible)
+    per_cluster = visual.get("by_cluster")
+    if isinstance(per_cluster, dict):
+        # A cluster whose speech windows overlap no speaking face must get an EMPTY
+        # distribution, not the episode-wide counts. `.get()` returning None used to
+        # fall back to global positives, which is precisely the cross-cluster
+        # contamination this exists to remove (measured: two off-screen clusters
+        # inherited 金发青年's votes).
+        cluster_votes = per_cluster.get(cluster_id, {})
+    else:
+        cluster_votes = None  # pre-v4 artifact: no per-window evidence at all
     vis_counts, vis_unobserved = visual_distribution(
         eligible, visual.get("anchors") or {}, int(visual.get("clips_total") or 0),
-        bool(visual.get("available")),
-        (visual.get("by_cluster") or {}).get(cluster_id))
-
+        bool(visual.get("available")), cluster_votes)
     distributions = {
         "acoustic": normalize_distribution(ac_counts, ac_unobserved),
         "visual": normalize_distribution(vis_counts, vis_unobserved),

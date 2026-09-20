@@ -786,7 +786,7 @@ class TestAvUnderstand(unittest.TestCase):
         self.assertEqual(note["visual"]["caption"], "雨夜")
         self.assertEqual(note["visual"]["actions"],
                          [{"who": "红衣女子", "what": "拔刀", "start": 421_500, "end": 423_000,
-                           "mouth_state": "unknown"}])
+                           "mouth_state": "unknown", "mouth_motion": "unknown"}])
         self.assertEqual(note["visual"]["camera"][0]["start"], 420_000)
         self.assertEqual(note["visible_text"], [])
         self.assertEqual(note["acoustic"]["events"][0]["start"], 422_200)
@@ -803,9 +803,9 @@ class TestAvUnderstand(unittest.TestCase):
         }, 100_000, 190_000)
         self.assertEqual(note["visual"]["actions"],
                          [{"who": "红衣女子", "what": "撑伞快走", "start": 105_000, "end": 108_000,
-                           "mouth_state": "unknown"},
+                           "mouth_state": "unknown", "mouth_motion": "unknown"},
                           {"who": "老者", "what": "驻足", "start": 165_000, "end": 168_000,
-                           "mouth_state": "unknown"}])
+                           "mouth_state": "unknown", "mouth_motion": "unknown"}])
 
     def test_parse_note_drops_out_of_timebase_and_counts(self):
         """A 200s timestamp inside a 90s window means the model ignored the local
@@ -914,7 +914,7 @@ class TestAvUnderstand(unittest.TestCase):
         stub.assert_called_once()
         self.assertTrue((av_dir / "av_note_000.json").is_file())
         notes = json.loads((ws / ".cache" / "visual" / "av_notes.json").read_text(encoding="utf-8"))
-        self.assertEqual(notes["schema"], "vts-av-notes/v3")
+        self.assertEqual(notes["schema"], av_understand_module.AV_NOTES_SCHEMA)
         self.assertEqual(notes["scene_notes"][0]["covered_pct"], 100.0)
         self.assertEqual(notes["scene_notes"][0]["segments"][0]["visual"]["actions"][0]["start"],
                          1_000)  # local 1.0s -> absolute 1000ms

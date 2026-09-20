@@ -37,7 +37,7 @@ import vocatives
 THUMB_WIDTH = 640
 # Kept in sync with av_understand.AV_NOTES_SCHEMA by a test (importing that module
 # here would drag the network client into an offline stdlib-only stage).
-EXPECTED_AV_NOTES_SCHEMA = "vts-av-notes/v3"
+EXPECTED_AV_NOTES_SCHEMA = "vts-av-notes/v4"
 # Same arrangement with speaker_diarize.SPEAKERS_SCHEMA.
 EXPECTED_SPEAKERS_SCHEMA = "vts-speakers/v2"
 

@@ -54,7 +54,7 @@ class TestParsing(unittest.TestCase):
 class TestComplianceGate(unittest.TestCase):
     def test_clean_channel_is_usable(self):
         actions = [{"start": i * 1000, "end": i * 1000 + 1500, "who": "金发青年",
-                    "what": "说话", "mouth_state": "moving"} for i in range(10)]
+                    "what": "说话", "mouth_state": "moving", "mouth_motion": "speaking"} for i in range(10)]
         stats = av.mouth_compliance([{"segments": [{"visual": {"actions": actions}}]}])
         self.assertEqual(stats["valid_rate"], 1.0)
         self.assertEqual(stats["window_compliance"], 1.0)
@@ -64,7 +64,7 @@ class TestComplianceGate(unittest.TestCase):
         """A 9s "action" cannot say who is talking in it, so obeying the enum is
         not enough - the ≤3s rule is part of the same bet."""
         actions = [{"start": 0, "end": 9_000, "who": "金发青年", "what": "说话",
-                    "mouth_state": "moving"}] * 10
+                    "mouth_state": "moving", "mouth_motion": "speaking"}] * 10
         stats = av.mouth_compliance([{"segments": [{"visual": {"actions": actions}}]}])
         self.assertEqual(stats["window_compliance"], 0.0)
         self.assertFalse(stats["usable"])
@@ -95,10 +95,10 @@ class TestPerClusterWindowing(unittest.TestCase):
         {"cluster_id": "SPEAKER_A2", "start_ms": 6000, "end_ms": 7000}]}
 
     def test_votes_follow_each_cluster_windows(self):
-        actions = [{"start": 1000, "end": 1500, "who": "金发青年", "mouth_state": "moving"},
-                   {"start": 6200, "end": 6600, "who": "老年女性", "mouth_state": "moving"},
+        actions = [{"start": 1000, "end": 1500, "who": "金发青年", "mouth_state": "moving", "mouth_motion": "speaking"},
+                   {"start": 6200, "end": 6600, "who": "老年女性", "mouth_state": "moving", "mouth_motion": "speaking"},
                    {"start": 3500, "end": 3900, "who": "金发青年", "mouth_state": "still"},
-                   {"start": 9000, "end": 9500, "who": "路人", "mouth_state": "moving"}]
+                   {"start": 9000, "end": 9500, "who": "路人", "mouth_state": "moving", "mouth_motion": "speaking"}]
         votes = resolve_cast.cluster_visual_votes(self.SPEAKERS, _note(actions))
         self.assertEqual(votes, {"SPEAKER_A1": {"金发青年": 1},
                                  "SPEAKER_A2": {"老年女性": 1}},
@@ -107,7 +107,7 @@ class TestPerClusterWindowing(unittest.TestCase):
     def test_a_downgraded_channel_still_reports_to_the_human(self):
         """The sheet shows untrusted votes on purpose: a person reading "chewing"
         next to "mouth moving" is how the mastication confounder gets caught."""
-        actions = [{"start": 1000, "end": 1500, "who": "黑发少女", "mouth_state": "moving"}]
+        actions = [{"start": 1000, "end": 1500, "who": "黑发少女", "mouth_state": "moving", "mouth_motion": "speaking"}]
         doc = resolve_cast.resolve(Path("/tmp"), {
             "approved": {},
             "acoustic": {"SPEAKER_A1": {"gender": "unknown", "age_band": "unknown",
@@ -124,12 +124,47 @@ class TestPerClusterWindowing(unittest.TestCase):
         self.assertFalse(entry["visual_trusted"])
 
 
+class TestNoCrossClusterContamination(unittest.TestCase):
+    """Measured regression: a cluster that overlaps no speaking face fell back to
+    the EPISODE-wide positives and inherited someone else's evidence, because
+    dict.get() returns None for a missing key and None meant "use global".
+    No evidence must mean an empty distribution, always."""
+
+    def test_a_cluster_with_no_window_overlap_votes_for_nobody(self):
+        approved = {"entities": [{
+            "id": "C1", "canonical_name": "金发青年", "status": "approved", "aliases": [],
+            "visual_label": "金发青年", "voice_profile": {},
+            "approved_by": "human", "approved_at": "2026-09-19",
+            "evidence": [{"kind": "signoff", "cluster_id": "SPEAKER_A1", "slot_id": "S1"}]}]}
+        ev = {"approved": approved,
+              "acoustic": {"SPEAKER_A1": {"gender": "unknown", "age_band": "unknown",
+                                          "timbre": "unknown", "speech_ms": 10, "line_count": 1,
+                                          "named": False},
+                           "SPEAKER_A2": {"gender": "unknown", "age_band": "unknown",
+                                          "timbre": "unknown", "speech_ms": 10, "line_count": 1,
+                                          "named": False}},
+              "address": {"events": [], "terms": {}, "not_speaker": {}},
+              "visual": {"clips_total": 4, "clips_visual_usable": 4, "clips_positive": 1,
+                         "anchors": {"positive_by_anchor": {"金发青年": 3}, "states_seen": {}},
+                         "by_cluster": {"SPEAKER_A1": {"金发青年": 3}},  # A2 absent on purpose
+                         "available": True}}
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        by_id = {c["cluster_id"]: c["assignment"] for c in doc["clusters"]}
+        self.assertEqual(by_id["SPEAKER_A2"]["families_supporting"], [],
+                         "A2 spoke no window where a face was seen talking")
+        self.assertEqual(by_id["SPEAKER_A2"]["candidates"], {})
+        self.assertNotEqual(by_id["SPEAKER_A1"]["families_supporting"], [],
+                            "A1 keeps its own evidence")
+
+
 class TestResolverConsumption(unittest.TestCase):
-    ACTIONS = [{"start": 0, "end": 1_500, "who": "金发青年", "what": "说话", "mouth_state": "moving"},
+    ACTIONS = [{"start": 0, "end": 1_500, "who": "金发青年", "what": "说话", "mouth_state": "moving", "mouth_motion": "speaking"},
                {"start": 2_000, "end": 3_400, "who": "金发青年", "what": "回头", "mouth_state": "still"},
                {"start": 4_000, "end": 5_200, "who": "黑发少女", "what": "站着", "mouth_state": "not_visible"}]
 
-    def test_only_moving_counts_as_positive(self):
+    def test_only_speaking_mouth_motion_counts_as_positive(self):
+        """ep02's breakfast scene made this distinction load-bearing: 5 of 10
+        "moving" actions were chewing, and chewing is not a person talking."""
         ev = resolve_cast.visual_evidence(_note(self.ACTIONS))
         self.assertEqual(ev["anchors"]["positive_by_anchor"], {"金发青年": 1})
         self.assertNotIn("黑发少女", ev["anchors"]["positive_by_anchor"])
