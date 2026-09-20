@@ -27,6 +27,11 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import series
+
+EXIT_NAMING_VIOLATION = 9  # a name-shaped speaker label traced to nothing while a
+#                              signed-off cast table is in force (v0.6 P1)
+
 PLACEHOLDER_RE = re.compile(r"\[\[SUB:(\d+)\]\]")
 SCENE_HEADING_RE = re.compile(r"^##\s*(第\s*\d+\s*场.*)$", re.M)  # legacy draft heading
 H2_TITLED_RE = re.compile(r"^##\s*场\s*\d+\s*【\s*([^】]*?)\s*】\s*(?:（([^）]*)）)?\s*$", re.M)
@@ -43,24 +48,9 @@ DIALOGUE_HEAD_RE = re.compile(
     r"^\*\*([^*\n]{1,24})\*\*(?:\s*$|\s*[（(][^）)]*[）)]\s*[：:]|\s*[：:])", re.M
 )
 
-# Generic, non-proper-noun speakers allowed without bible backing. Only role,
-# kinship and narration words belong here - production-specific descriptive
-# labels must come from the workspace (materials/bible.json "speaker_whitelist"
-# or characters_manifest), not from this plugin-level list.
-GENERIC_SPEAKERS = {
-    "旁白", "解说", "画外音", "众人", "群臣", "众侍", "大家",
-    "路人", "店员", "摊主", "店主", "顾客", "客人", "司机",
-    "孩子", "家人", "家人们", "长辈", "少女", "少年", "同学",
-    "侍从", "员工", "工作人员", "广播", "广播员", "广告",
-    "童声", "呼声", "合唱", "神秘人物",
-    "姐姐", "姐姐们", "哥哥", "父亲", "母亲", "奶奶", "爷爷",
-}
-# Descriptive (non-proper-noun) label patterns, e.g. 「王子的声音」「神秘的声音」.
-# The writing contract permits descriptive tags for unnamed characters; the
-# lint's job is to catch fabricated PROPER nouns, not these.
-DESCRIPTIVE_SPEAKER_RE = re.compile(r"^[^（）]{1,12}(的声音|之声)$")
-PAREN_QUALIFIER_RE = re.compile(r"[（(][^（）()]*[)）]\s*$")
-
+# The label taxonomy lives in one module so this lint and resolve_cast.py cannot
+# disagree about what "looks like a proper noun".
+import speaker_labels as labels  # noqa: E402
 
 def load_json(path: Path) -> Optional[Any]:
     if not path.is_file():
@@ -204,49 +194,68 @@ def normalize_scene_text(text: str, pos: int, start_tc: str, end_tc: str) -> str
     return head + "\n" + text.lstrip("\n")
 
 
-def _speaker_is_known(name: str, allowed: set) -> bool:
-    """True when a dialogue-head name traces back to an allowed source.
+def _dialogue_heads(text: str) -> List[str]:
+    """Every dialogue head in one scene, scene slug excluded.
 
-    Tolerates three benign decorations, never invents approvals:
-      - trailing qualifier in parens: 「路人（男）」 -> 路人
-      - voice-of pattern: 「王子的声音」 -> descriptive label (contract-legal)
-      - bible alias prefix (>=2 chars): bible「菈菈」 admits 「菈菈与妈妈」
+    A head like 「**菈菈、陌生旅人**（躬身）：你好」 names more than one speaker, so
+    each part is judged on its own.
     """
-    candidates = [name]
-    stripped = PAREN_QUALIFIER_RE.sub("", name).strip()
-    if stripped and stripped != name:
-        candidates.append(stripped)
-    for cand in candidates:
-        if cand in allowed:
-            return True
-        if DESCRIPTIVE_SPEAKER_RE.match(cand):
-            return True
-        if any(len(a) >= 2 and cand.startswith(a) for a in allowed):
-            return True
-    return False
+    heads: List[str] = []
+    slug = SLUG_LINE_RE.search(text)
+    slug_start = slug.start() if slug else -1
+    for m in DIALOGUE_HEAD_RE.finditer(text):
+        if m.start() == slug_start:
+            continue
+        heads.append(m.group(1).strip())
+    return heads
 
 
-def lint_speaker_names(spliced_texts: List[str], allowed: set) -> List[str]:
-    """Anti-hallucination guard: dialogue header names must be known. Warnings only.
-    Heads like 「茉里、菈菈」 are split on 、/／ and every part is checked.
-    Each scene's first bold line is its slug (`**黑场**`, `**内景·日**｜…`) and is
-    never a dialogue head."""
-    warnings: List[str] = []
-    used = set()
+def audit_speaker_labels(spliced_texts: List[str], allowed: set) -> Dict[str, List[str]]:
+    """Classify every speaker label in the delivered text.
+
+    Returns {"named": traced to the cast/bible, "descriptive": shape says it is a
+    role/voice description, "untraced": name-shaped but traceable to nothing}.
+    `untraced` is the only fatal-eligible bucket, and `descriptive` is the one the
+    fidelity report must keep counting: a run that leans on descriptions is not
+    a failure, it is an unfinished cast table, and pretending otherwise is what
+    pushed writers towards longer labels rather than better evidence.
+    """
+    buckets: Dict[str, List[str]] = {"named": [], "descriptive": [], "untraced": []}
     for text in spliced_texts:
-        slug = SLUG_LINE_RE.search(text)
-        slug_start = slug.start() if slug else -1
-        for m in DIALOGUE_HEAD_RE.finditer(text):
-            if m.start() == slug_start:
-                continue
-            for part in re.split(r"[、/／]", m.group(1).strip()):
-                part = part.strip()
-                if part:
-                    used.add(part)
-    unknown = sorted(n for n in used if not _speaker_is_known(n, allowed))
-    if unknown:
-        warnings.append(f"未登记的说话人名称（请核对是否杜撰）: {', '.join(unknown[:10])}")
-    return warnings
+        for head in _dialogue_heads(text):
+            verdict = labels.audit_head(head, allowed)
+            for part in verdict["descriptive"]:
+                if part not in buckets["descriptive"]:
+                    buckets["descriptive"].append(part)
+            for part in verdict["traced"]:
+                if part not in buckets["named"]:
+                    buckets["named"].append(part)
+            for part in verdict["untraced"]:
+                if part not in buckets["untraced"]:
+                    buckets["untraced"].append(part)
+    return buckets
+
+
+def lint_speaker_names(spliced_texts: List[str], allowed: set,
+                       cast_enforced: bool = False) -> List[str]:
+    """Anti-hallucination guard, reversed direction (v0.6 P1).
+
+    Before v0.6 a label passed only if it matched one narrow suffix pattern, so
+    「女声」「系统音」「关西腔者」 were flagged while 「威严的声音」 sailed through -
+    the guard punished short honest descriptions and rewarded long ones. Now a
+    label is accepted when its SHAPE is descriptive, and only name-shaped labels
+    have to trace back to a known surface. Without a cast table there is nothing
+    to trace against, so this stays a warning that says why; with one, the caller
+    escalates to a fatal exit.
+    """
+    buckets = audit_speaker_labels(spliced_texts, allowed)
+    untraced = buckets["untraced"]
+    if not untraced:
+        return []
+    listed = ", ".join(untraced[:10])
+    if cast_enforced:
+        return [f"表外专名说话人（演员表已生效，必须是这些之一）: {listed}"]
+    return [f"未登记的说话人名称（请核对是否杜撰）: {listed}"]
 
 
 def _cell(value: Any) -> str:
@@ -331,9 +340,16 @@ def main():
         }
         expected_by_scene.append(expected)
 
-    allowed_names = set(GENERIC_SPEAKERS) | set(manifest.get("bible_names") or []) | set(
-        manifest.get("characters_manifest") or {}
-    )
+    # v0.6: the approved cast table is a naming source like bible names, and its
+    # presence is also what makes an untraceable name fatal instead of advisory -
+    # without a table there is nothing to trace against, so the guard says so and
+    # lets --draft output proceed (a gate nobody can satisfy gets routed around).
+    cast_entities = [e for e in (series.load_approved(ws).get("entities") or [])
+                     if isinstance(e, dict) and str(e.get("status") or "").lower() == "approved"]
+    cast_enforced = bool(cast_entities)
+    allowed_names = (set(labels.GENERIC_SPEAKERS) | set(manifest.get("bible_names") or [])
+                     | set(manifest.get("characters_manifest") or {})
+                     | set(series.approved_names(ws)))
 
     spliced_texts, warnings, spliced_count = validate_and_splice(scene_files, expected_by_scene, verbatim)
     tc_pairs = [(_fmt_tc(sc.get("start_timecode")), _fmt_tc(sc.get("end_timecode"))) for sc in manifest["scenes"]]
@@ -341,7 +357,9 @@ def main():
         normalize_scene_text(text, pos, start_tc, end_tc)
         for pos, (text, (start_tc, end_tc)) in enumerate(zip(spliced_texts, tc_pairs), start=1)
     ]
-    warnings += lint_speaker_names(spliced_texts, allowed_names)
+    naming_warnings = lint_speaker_names(spliced_texts, allowed_names, cast_enforced=cast_enforced)
+    warnings += naming_warnings
+    label_buckets = audit_speaker_labels(spliced_texts, allowed_names)
 
     title = args.title or ws.name
     safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
@@ -389,7 +407,22 @@ def main():
         f"> **台词保真说明**：全片 {len(verbatim)} 条字幕以 [[SUB:n]] 占位符由脚本从字幕轨逐字回填，"
         f"本次拼装 {spliced_count}/{len(verbatim)} 条，覆盖率 {spliced_count / max(1, len(verbatim)):.1%}；"
         "台词文本未经过任何改写。\n"
+        ">\n"
+        f"> **说话人标签构成**：可溯源 {len(label_buckets['named'])} 个、"
+        f"描述性（未定名）{len(label_buckets['descriptive'])} 个、"
+        f"表外专名 {len(label_buckets['untraced'])} 个"
+        + ("；演员表已生效，表外专名为致命" if cast_enforced
+           else "；本工作区未绑定已签核演员表，故仅告警（成稿按未核验处理）") + "\n"
     )
+
+    if cast_enforced and label_buckets["untraced"]:
+        # Naming is the one thing a signed-off table exists to make impossible to
+        # drift, so this fails BEFORE the deliverable is written, not after.
+        sys.stderr.write(
+            "[FATAL] 演员表已生效，但以下说话人标签溯源不到任何签核条目（可能是杜撰的专名）: "
+            + ", ".join(label_buckets["untraced"])
+            + "\n[ACTION] 回到阶段 3.7 的签核环节定名，或按 --draft 语义解除系列绑定后重试。\n")
+        sys.exit(EXIT_NAMING_VIOLATION)
 
     body = "\n---\n\n".join(part.strip() + "\n" for part in spliced_texts)
     document = "\n".join(header) + "\n" + body + appendix

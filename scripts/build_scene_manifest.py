@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import op_ed
+import series
+import vocatives
 
 THUMB_WIDTH = 640
 # Kept in sync with av_understand.AV_NOTES_SCHEMA by a test (importing that module
@@ -80,7 +82,10 @@ WRITING_CONTRACT = """\
    屏显文字（时间码对得上的优先），关键帧管构图与人物外观；av_notes 里的描述
    是目击证据，绝不当台词写进正文，其中人物一律是描述性称呼、以台词与
    characters_manifest 的称呼为准。
-4. 角色名只能来自 bible.characters / characters_manifest / 本场 dialogues 里出现过的称呼；
+4. 角色名只能来自 bible.characters / characters_manifest / 演员表；
+   **台词里出现的人名是被称呼的人（听者），绝不是那句话的说话人**——清单里的
+   address_terms 就是本集被称呼统计，据此排除而非据此认定；
+
    认不出的人用描述性指称（路人（男）/神秘人物），绝不发明专有名词。
    描述性指称要取材清单里的 speaker_profiles（声学层实测的性别/年龄带/音线，
    如「青年男声」「老年女声」），并在 support 显示只有 1 条观测时降为「男声」这类
@@ -253,6 +258,25 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
     # here, in the workspace's bible - never hardcoded in the plugin.
     bible_names.extend(str(w) for w in (bible_doc.get("speaker_whitelist") or []) if str(w).strip())
 
+    # v0.6 P1: who is being ADDRESSED. A name in address position names the
+    # listener, so it can never say who spoke - handing the writer this statistic
+    # is what stops the ep02 scene 1 mistake (「茉里 你交朋友了」 written as 茉里
+    # speaking). Detection runs against the known-name list only, never an open
+    # parse, so nothing here decides what counts as a name.
+    known_surfaces = set(bible_names) | set(characters_manifest) | set(series.approved_names(ws))
+    all_lines = [d for rows in dialogues_by_scene.values() for d in rows]
+    address = vocatives.extract_address_terms(
+        all_lines, known_surfaces, index_key="sub_index", speaker_key="speaker")
+    address_terms = [
+        {"term": t, "count": b["count"], "spoken_by": b["spoken_by"],
+         "roles": b["roles"]}
+        for t, b in sorted(address["terms"].items(), key=lambda kv: -kv[1]["count"])
+    ]
+    if address_terms:
+        sys.stderr.write(
+            "[INFO] 呼语证据（被称呼者，不是说话人）: "
+            + ", ".join(f"{a['term']}×{a['count']}" for a in address_terms[:8]) + "\n")
+
     exemplars = detect_exemplars(ws)
     if not exemplars:
         sys.stderr.write("[INFO] No exemplar screenplays found next to the workspace; writer relies on the style card only.\n")
@@ -333,6 +357,7 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
         "bible_names": bible_names,
         "characters_manifest": characters_manifest,
         "speaker_profiles": speaker_profiles,
+        "address_terms": address_terms,
         "exemplars": exemplars,
         "total_scenes": len(manifest_scenes),
         "scenes": manifest_scenes,

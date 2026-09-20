@@ -172,10 +172,20 @@ class TestSpeakerLint(unittest.TestCase):
         self.assertEqual(sp.lint_speaker_names([text], {"菈菈", "茉里", "旁白"}), [])
 
     def test_merged_inline_head_is_linted(self):
+        """A head naming several speakers is judged part by part - and only the
+        name-shaped part is flagged. 「陌生旅人」 is a description, not a name
+        (v0.6 P1 reversed the direction; the old rule flagged it)."""
         allowed = {"菈菈", "茉里"}
-        text = "**菈菈**（躬身）：你好／再见\n\n**陌生旅人**：嗯\n"
-        warnings = sp.lint_speaker_names([text], allowed)
-        self.assertTrue(any("陌生旅人" in w for w in warnings))
+        slug = "**内景·日**｜房间\n\n"
+        text = slug + "**菈菈**（躬身）：你好／再见\n\n**陌生旅人**：嗯\n"
+        self.assertEqual(sp.lint_speaker_names([text], allowed), [])
+        buckets = sp.audit_speaker_labels([text], allowed)
+        self.assertIn("陌生旅人", buckets["descriptive"])   # counted, not punished
+        self.assertIn("菈菈", buckets["named"])
+
+        text2 = slug + "**菈菈**（躬身）：你好／再见\n\n**艾拉**：嗯\n"
+        warnings = sp.lint_speaker_names([text2], allowed)
+        self.assertTrue(any("艾拉" in w for w in warnings))
 
     def test_slug_and_character_lines_are_not_dialogue_heads(self):
         text = "**内景·日**｜测试房间\n\n**人物：** 菈菈、陌生旅客\n"
@@ -203,12 +213,26 @@ class TestSpeakerLint(unittest.TestCase):
         warnings = sp.lint_speaker_names([slug + "**菈某与妈妈**\n好啊\n"], {"菈"})
         self.assertTrue(any("菈某与妈妈" in w for w in warnings))
 
-    def test_production_specific_label_warns_unless_whitelisted(self):
-        # Burned-in show vocabulary was removed from the plugin whitelist:
-        # such labels must come from the workspace bible (speaker_whitelist).
+    def test_descriptive_shape_is_not_a_naming_violation(self):
+        """v0.6 P1 replaced the old rule, which flagged 「面试的店主」「女声」
+        「系统音」 while passing 「威严的声音」 - equally descriptive labels got
+        opposite treatment purely on suffix shape, so the cheapest way to satisfy
+        the guard was a LONGER label rather than better evidence."""
         text = "**内景·日**｜店铺\n\n**面试的店主**\n请进\n"
-        self.assertTrue(any("面试的店主" in w for w in sp.lint_speaker_names([text], set())))
-        self.assertEqual(sp.lint_speaker_names([text], {"面试的店主"}), [])
+        self.assertEqual(sp.lint_speaker_names([text], set()), [])
+        self.assertIn("面试的店主", sp.audit_speaker_labels([text], set())["descriptive"])
+
+    def test_the_reverse_bias_examples_all_pass(self):
+        """The three labels ep02 measured as false alarms, verbatim."""
+        text = "**内景·日**｜店铺\n\n**女声**：嗯\n\n**系统音**：请输入\n\n**关西腔者**：多谢\n"
+        self.assertEqual(sp.lint_speaker_names([text], set()), [])
+
+    def test_one_char_stem_before_a_descriptive_tail_still_traces(self):
+        """「凉音」 reads as a name even though 音 is a descriptive tail - the >=2
+        char stem is what stops a real character name from sailing through."""
+        text = "**内景·日**｜店铺\n\n**凉音**：早\n"
+        warnings = sp.lint_speaker_names([text], set())
+        self.assertTrue(any("凉音" in w for w in warnings))
 
 
 class TestHeadingNormalization(unittest.TestCase):
