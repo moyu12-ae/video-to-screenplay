@@ -10,6 +10,7 @@ the assembly tables.
 """
 
 import io
+import json
 import re
 import sys
 import tempfile
@@ -233,6 +234,47 @@ class TestSpeakerLint(unittest.TestCase):
         text = "**内景·日**｜店铺\n\n**凉音**：早\n"
         warnings = sp.lint_speaker_names([text], set())
         self.assertTrue(any("凉音" in w for w in warnings))
+
+
+class TestSpeakerLineageGate(unittest.TestCase):
+    """v0.6 P5: "in the table" is not the same as "signed off as this speaker".
+
+    The accident that started this design reads, to a membership check, like a
+    perfectly legal name: 茉里 IS a character in that show. What makes the label
+    wrong is that no cluster was ever signed off as her - she was the person being
+    talked to. Only a lineage check can tell those apart.
+    """
+    CAST = {
+        "entities": [{"id": "C1", "canonical_name": "茉里", "status": "approved",
+                      "aliases": ["マリー"]},
+                     {"id": "C2", "canonical_name": "托德", "status": "approved", "aliases": []}],
+        "slots": [{"slot_id": "S1", "entity_id": "C2"}],
+        "clusters": [{"cluster_id": "SPEAKER_A1",
+                      "assignment": {"slot_id": "S1", "status": "approved"}}],
+    }
+
+    def test_lineage_list_holds_only_signed_speakers(self):
+        self.assertEqual(sp.cast_lineage_names(self.CAST), ["托德"])
+
+    def test_a_real_character_still_fails_without_lineage(self):
+        lineage = set(sp.cast_lineage_names(self.CAST))
+        text = "**内景·日**｜早饭桌\n\n**茉里**：我没有\n"
+        self.assertTrue(any("茉里" in w for w in
+                            sp.lint_speaker_names([text], lineage, cast_enforced=True)))
+        self.assertEqual(sp.lint_speaker_names([text.replace("**茉里**", "**托德**")],
+                                               lineage, cast_enforced=True), [])
+
+    def test_alias_of_a_signed_speaker_is_enough(self):
+        cast = json.loads(json.dumps(self.CAST))
+        cast["clusters"][0]["assignment"]["slot_id"] = "S0"
+        cast["slots"].append({"slot_id": "S0", "entity_id": "C1"})
+        lineage = set(sp.cast_lineage_names(cast))
+        self.assertIn("マリー", lineage)
+        self.assertEqual(sp.lint_speaker_names(["**内景·日**｜x\n\n**マリー**：嗯\n"],
+                                               lineage, cast_enforced=True), [])
+
+    def test_no_cast_document_means_no_lineage_requirement(self):
+        self.assertIsNone(sp.cast_lineage_names(None))
 
 
 class TestHeadingNormalization(unittest.TestCase):

@@ -40,6 +40,69 @@ SLOTS = [{"slot_id": "S1", "candidates": ["托德"], "profile": {"gender": "male
          {"slot_id": "S2", "candidates": ["奶奶"], "profile": {"gender": "female"}}]
 
 
+class TestConfirmationPath(unittest.TestCase):
+    """A name the human supplies that this slot did not propose must be asked
+    about, then written WITH a lineage record - an entity that merely exists in
+    the table says nothing about which speaker it is."""
+
+    def test_table_name_buried_in_a_chatty_reply_is_surfaced_as_the_proposal(self):
+        outcome = so.parse_reply("S1 那个就叫托德吧", [{"slot_id": "S1", "candidates": [],
+                                                      "profile": {}}], ["托德", "茉里"])
+        self.assertEqual(outcome["needs_confirmation"][0]["name"], "托德",
+                         "the question must show a name, not the whole sentence")
+        self.assertIn("已在演员表里", outcome["needs_confirmation"][0]["why"])
+
+    def test_linking_an_existing_entity_records_the_cluster(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            existing = {"entities": [{"id": "C2", "canonical_name": "托德", "status": "approved",
+                                      "aliases": [], "evidence": [],
+                                      "approved_by": "human", "approved_at": "2026-09-19"}]}
+            (root / "cast.approved.json").write_text(json.dumps(existing, ensure_ascii=False),
+                                                     encoding="utf-8")
+            slots = [{"slot_id": "S3", "cluster_id": "SPEAKER_A1", "candidates": [],
+                      "profile": {"gender": "male"}}]
+            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"})
+            doc = json.loads((root / "cast.approved.json").read_text(encoding="utf-8"))
+            records = [e for e in doc["entities"][0]["evidence"]
+                       if isinstance(e, dict) and e.get("kind") == "signoff"]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["cluster_id"], "SPEAKER_A1")
+            self.assertEqual(records[0]["slot_id"], "S3")
+            # idempotent: answering the same round twice must not duplicate lineage
+            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"})
+            doc = json.loads((root / "cast.approved.json").read_text(encoding="utf-8"))
+            self.assertEqual(len([e for e in doc["entities"][0]["evidence"]
+                                  if isinstance(e, dict) and e.get("kind") == "signoff"]), 1)
+
+    def test_confirm_flag_is_the_only_way_a_non_candidate_name_gets_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "series"
+            ws = root / "episodes" / "ep02"
+            (ws / ".cache" / "cast").mkdir(parents=True)
+            (ws / "materials").mkdir(parents=True)
+            (root / "cast.approved.json").write_text(json.dumps(
+                {"schema": "vts-cast/v1", "version": "0", "entities": []}), encoding="utf-8")
+            series.bind_series(ws, root)
+            doc = json.loads(json.dumps(CAST_DOC))
+            doc["pending"] = [{"slot_id": "S1", "cluster_id": "SPEAKER_A1", "reason": "新"}]
+            doc["slots"] = [{"slot_id": "S1", "profile": {"gender": "male"}, "status": "pending",
+                             "entity_id": None, "origin": "this_episode"}]
+            (ws / ".cache" / "cast" / "cast.json").write_text(json.dumps(doc, ensure_ascii=False),
+                                                              encoding="utf-8")
+            blocked = subprocess.run([sys.executable, str(SCRIPTS_DIR / "cast_signoff.py"),
+                                      "-w", str(ws), "--reply", "S1=艾拉", "--apply"],
+                                     capture_output=True, text=True)
+            self.assertIn("本轮未写盘", blocked.stderr)
+            self.assertEqual(series.load_approved(ws)["entities"], [])
+            done = subprocess.run([sys.executable, str(SCRIPTS_DIR / "cast_signoff.py"),
+                                   "-w", str(ws), "--reply", "S1=艾拉", "--apply",
+                                   "--confirm", "S1=艾拉"], capture_output=True, text=True)
+            self.assertIn("signed_off", done.stdout)
+            self.assertEqual([e["canonical_name"] for e in series.load_approved(ws)["entities"]],
+                             ["艾拉"])
+
+
 class TestRounds(unittest.TestCase):
     def test_five_pending_slots_need_two_rounds_not_a_strand(self):
         """The pre-v0.6 rule was "ask at most 4, leave the rest unknown" - which

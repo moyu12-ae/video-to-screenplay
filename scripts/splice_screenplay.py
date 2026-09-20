@@ -195,6 +195,39 @@ def normalize_scene_text(text: str, pos: int, start_tc: str, end_tc: str) -> str
     return head + "\n" + text.lstrip("\n")
 
 
+def cast_lineage_names(cast_doc: Optional[Dict[str, Any]]) -> Optional[List[str]]:
+    """Names a HUMAN attached to a specific speaking cluster, plus their aliases.
+
+    The difference from "names present in the cast table" is the whole point:
+    茉里 can be a perfectly well-signed-off character while the cluster that spoke
+    「茉里 你交朋友了」 was never signed off as her - the ep02 accident reads exactly
+    like a legitimate name. Only lineage stops it, so the enforced allow-list is
+    built from cluster assignments, not from the entity list.
+    """
+    if not isinstance(cast_doc, dict):
+        return None
+    entities = {str(e.get("id")): e for e in (cast_doc.get("entities") or [])
+                if isinstance(e, dict)}
+    slots = {str(s.get("slot_id")): s for s in (cast_doc.get("slots") or [])
+             if isinstance(s, dict)}
+    out: List[str] = []
+    for cluster in cast_doc.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        assignment = cluster.get("assignment") or {}
+        if str(assignment.get("status")) != "approved":
+            continue
+        slot = slots.get(str(assignment.get("slot_id"))) or {}
+        entity = entities.get(str(assignment.get("entity_id") or slot.get("entity_id"))) or {}
+        name = str(entity.get("canonical_name") or assignment.get("entity_name") or "").strip()
+        if not name:
+            continue
+        for surface in [name] + [str(a).strip() for a in (entity.get("aliases") or [])]:
+            if surface and surface not in out:
+                out.append(surface)
+    return out
+
+
 def _dialogue_heads(text: str) -> List[str]:
     """Every dialogue head in one scene, scene slug excluded.
 
@@ -365,9 +398,16 @@ def main():
     cast_entities = [e for e in (series.load_approved(ws).get("entities") or [])
                      if isinstance(e, dict) and str(e.get("status") or "").lower() == "approved"]
     cast_enforced = bool(cast_entities)
-    allowed_names = (set(labels.GENERIC_SPEAKERS) | set(manifest.get("bible_names") or [])
-                     | set(manifest.get("characters_manifest") or {})
-                     | set(series.approved_names(ws)))
+    cast_doc = load_json(ws / ".cache" / "cast" / "cast.json")
+    lineage = cast_lineage_names(cast_doc)
+    # Once the resolver has run there IS a lineage record to check, so bible and
+    # manifest names stop being a licence: they predate the table and cannot say
+    # which cluster they belong to.
+    allowed_names = (
+        set(labels.GENERIC_SPEAKERS) | set(lineage)
+        if cast_doc and lineage is not None
+        else set(labels.GENERIC_SPEAKERS) | set(manifest.get("bible_names") or [])
+        | set(manifest.get("characters_manifest") or {}) | set(series.approved_names(ws)))
 
     spliced_texts, warnings, spliced_count = validate_and_splice(scene_files, expected_by_scene, verbatim)
     tc_pairs = [(_fmt_tc(sc.get("start_timecode")), _fmt_tc(sc.get("end_timecode"))) for sc in manifest["scenes"]]
@@ -382,7 +422,6 @@ def main():
     # scratch file: an episode where the resolver abstained on most speakers is not
     # "done, with warnings", and the reader needs to see that before trusting a
     # name that appears in the text.
-    cast_doc = load_json(ws / ".cache" / "cast" / "cast.json")
     cast_summary = summarize_cast(cast_doc) if isinstance(cast_doc, dict) else None
     # --draft semantics: shipping without sign-off is allowed, being quiet about
     # it is not. The notice sits in the deliverable's own header table, because an

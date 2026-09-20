@@ -72,9 +72,13 @@ def pending_slots(cast_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
         seen.add(slot_id)
         slot = _label_for_cast_slot(cast_doc, str(slot_id))
         cluster = (entry.get("cluster_id") if isinstance(entry, dict) else None) or ""
+        excluded = _ruled_out_for(cast_doc, cluster)
         candidates = _candidates_for(cast_doc, str(slot_id), cluster)
         out.append({"slot_id": str(slot_id), "cluster_id": cluster,
                     "profile": slot.get("profile") or {}, "candidates": candidates,
+                    # Shown so a human cannot re-commit the original mistake: this
+                    # cluster spoke lines ADDRESSING these people, so it is not them.
+                    "ruled_out": excluded,
                     "reason": (entry.get("reason") if isinstance(entry, dict) else "") or ""})
     return out
 
@@ -107,7 +111,17 @@ def _candidates_for(cast_doc: Dict[str, Any], slot_id: str, cluster_id: str) -> 
     for term, count in sorted(terms.items(), key=lambda kv: -int(kv[1] or 0)):
         if str(term) not in names:
             names.append(str(term))
-    return names[:3]
+    # An address term names the LISTENER. Showing it under the cluster that spoke
+    # it would be the ep02 accident wearing a UI, so it is filtered out here too.
+    ruled_out = set(_ruled_out_for(cast_doc, cluster_id))
+    return [n for n in names[:3] if n not in ruled_out]
+
+
+def _ruled_out_for(cast_doc: Dict[str, Any], cluster_id: str) -> List[str]:
+    for cluster in cast_doc.get("clusters") or []:
+        if isinstance(cluster, dict) and cluster.get("cluster_id") == cluster_id:
+            return [str(t) for t in (cluster.get("not_speaker") or [])]
+    return []
 
 
 def render_table(slots: List[Dict[str, Any]]) -> str:
@@ -118,8 +132,22 @@ def render_table(slots: List[Dict[str, Any]]) -> str:
         desc = "；".join(str(profile.get(k) or "") for k in ("gender", "age_band", "timbre")
                         if profile.get(k) and profile.get(k) != "unknown") or "（无可用画像）"
         cands = "／".join(slot.get("candidates") or []) or "（无候选，建议保留描述性标签）"
+        ruled = slot.get("ruled_out") or []
+        if ruled:
+            cands += f"（不是 {'、'.join(ruled)}——这簇台词里在叫他们）"
         rows.append(f"| {slot['slot_id']} | {desc} | {cands} | {slot.get('reason') or '新出现'} |")
     return "\n".join(rows)
+
+
+def _example(window: List[Dict[str, Any]]) -> str:
+    """An example that names the slots actually on screen - the first draft showed
+    `S1=托德 S2=奶奶` while the round displayed S3/S4, and the human's answer was
+    then correctly rejected as 'no such slot this round'."""
+    slots = [str(s.get("slot_id")) for s in window[:2]]
+    if not slots:
+        return "`（本轮无待答槽位）`"
+    tail = " ".join(f"{sid}=跳过" for sid in slots[1:])
+    return "`" + " ".join([f"{slots[0]}=名字"] + ([tail] if tail else [])) + "`"
 
 
 def render_prompt(cast_doc: Dict[str, Any], offset: int = 0
@@ -133,7 +161,8 @@ def render_prompt(cast_doc: Dict[str, Any], offset: int = 0
               f"已定名 {sum(1 for c in (cast_doc.get('clusters') or [])
                             if (c.get('assignment') or {}).get('status') == 'approved')} 个、"
               f"待你定名 {len(pending)} 个。\n\n{table}\n\n"
-              "回话示例：`S1=托德 S2=奶奶 S3=跳过`，或整句「S1 那个金发的叫托德」。")
+              + "回话示例：" + _example(window) + "，或整句「"
+              + (f"{window[0]['slot_id']} 那个金发的就叫…" if window else "…") + "」")
     if remaining > 0:
         header += f"\n\n（本轮只问 {SLOTS_PER_ROUND} 个，后面还有 {remaining} 个，看完这轮再问你要不要继续。）"
     return header, window, remaining
@@ -238,6 +267,12 @@ def _record(slot_id: str, value: str, by_slot: Dict[str, Any], approved_names: L
         decisions[slot_id] = DECISION_ACCEPT
         decisions[f"{slot_id}:name"] = inside[0]
         return
+    # A name the table already knows may still be buried in a chatty reply
+    # ("就叫托德"). Surfacing it as the PROPOSED name keeps the question honest -
+    # it is still confirmation-gated, but the human reads a name, not a sentence.
+    inside_table = [n for n in approved_names if n and n in value]
+    if len(inside_table) == 1:
+        value = inside_table[0]
     needs_confirmation.append({
         "slot_id": slot_id, "name": value,
         "why": (f"「{value}」不在 {slot_id} 的候选里"
@@ -284,6 +319,17 @@ def apply_round(series_root: Path, cast_doc: Dict[str, Any], slots: List[Dict[st
         else:
             diff.append({"slot_id": slot_id, "change": "linked_existing", "name": name})
         existing = by_name[name]
+        # The lineage record is what makes the link survive the next resolve: an
+        # entity that merely EXISTS in the table says nothing about which speaker
+        # it is, and that distinction is the whole ep02 accident.
+        record = {"kind": "signoff", "slot_id": slot_id, "cluster_id": slot.get("cluster_id"),
+                  "date": date.today().isoformat()}
+        evidence = existing.setdefault("evidence", [])
+        if isinstance(evidence, list) and not any(
+                isinstance(e, dict) and e.get("kind") == "signoff"
+                and e.get("slot_id") == slot_id and e.get("cluster_id") == record["cluster_id"]
+                for e in evidence):
+            evidence.append(record)
         label = (slot.get("profile") or {}).get("visual") or ""
         if label and not existing.get("visual_label"):
             existing["visual_label"] = str(label)
@@ -323,6 +369,9 @@ def main() -> None:
     parser.add_argument("--reply", default=None, help="Natural-language answer to parse")
     parser.add_argument("--apply", action="store_true",
                         help="Write a parsed reply into the series cast table")
+    parser.add_argument("--confirm", action="append", default=[], metavar="SLOT=NAME",
+                        help="Names the user confirmed after being asked (repeatable); "
+                             "without them a round holding needs_confirmation writes nothing")
     args = parser.parse_args()
 
     ws = Path(args.workspace).resolve()
@@ -341,6 +390,17 @@ def main() -> None:
         window = pending_slots(cast_doc)[args.offset:args.offset + SLOTS_PER_ROUND]
         outcome = parse_reply(args.reply, window, series.approved_names(ws))
         outcome["slots_in_round"] = [s["slot_id"] for s in window]
+        for pair in args.confirm:
+            slot_id, _, name = pair.partition("=")
+            slot_id, name = slot_id.strip(), name.strip()
+            if not slot_id or not name:
+                continue
+            if slot_id not in {w["slot_id"] for w in window}:
+                continue
+            outcome["decisions"][slot_id] = DECISION_ACCEPT
+            outcome["decisions"][f"{slot_id}:name"] = name
+            outcome["needs_confirmation"] = [n for n in outcome["needs_confirmation"]
+                                             if n.get("slot_id") != slot_id]
         sys.stdout.write(json.dumps(outcome, ensure_ascii=False, indent=2) + "\n")
         if args.apply:
             if outcome["needs_confirmation"] or outcome["unparsed"]:

@@ -60,12 +60,16 @@ description: 将动漫、电影或电视剧视频转化为制作级中文场号�
      │   （grouper 按序列墙分段、段内 DP 精切；无大纲则整体平切）
      ├── align_timeline.py         → aligned_timeline.json（每条台词只分配一次，取最大重叠）
      │  阶段 3.7：声画理解（可选，推荐——让 AI 真正看视频再写 △）
-     ├── av_understand.py  prepare → run → merge → av_notes.json（动作/镜头/声学/屏显文字证据）
+     ├── av_understand.py  prepare → run → merge → av_notes.json（动作/镜头/声学/屏显文字证据 + mouth_state 遵从率）
+     │  阶段 3.8：演员表收敛（v0.6，唯一命名权威；只出候选，绝不产名字）
+     ├── resolve_cast.py           → cast.json（槽位 / 候选分布 / margin / 弃权 / 过切分审计）
+     ├── cast_signoff.py --render  → 一轮 4 个槽位的候选表（agent 打印给用户，用户回一句自然语言）
+     ├── cast_signoff.py --apply   → <系列根>/cast.approved.json（带 version 与 history，工作区只读快照）
      │  阶段 4：场景写作（多模态 LLM 撰写真实剧本，分块可续跑）
      ├── build_scene_manifest.py   → scene_manifest.json（证据包 + 写作契约）
      ├── agent 读关键帧+av_notes+台词 → 写 scene_drafts/scene_XX.md（台词以 [[SUB:n]] 占位）
      │  阶段 5：逐字拼装与成稿
-     └── splice_screenplay.py      → output/<标题>_影视文学剧本.md
+     └── splice_screenplay.py      → output/<标题>_影视文学剧本.md（表外专名致命，退出码 9）
 ```
 
 ---
@@ -173,6 +177,28 @@ python3 scripts/av_understand.py --workspace "<ws>" run       # 直连逐段理�
 - 🔴 **红线**：av_notes 是**证据层**——绝不成为台词文本（台词永远 `[[SUB:n]]` 逐字来自字幕）、绝不改判声学归属、绝不替代关键帧。
 - 跳过本 pass：阶段 4 退回纯关键帧证据，流水线其余不受影响。
 
+### 阶段 3.8 —— 演员表：唯一命名权威（v0.6，设计见 `references/cast_glossary_v0.6.md`）
+
+```bash
+python3 scripts/resolve_cast.py     --workspace "<ws>"                       # 只收敛，不产名字
+python3 scripts/cast_signoff.py     --workspace "<ws>" --render              # 打印本轮候选表（≤4 槽位）
+python3 scripts/cast_signoff.py     --workspace "<ws>" --reply "<用户原话>" --apply
+python3 scripts/workspace.py        series  --workspace "<ws>"               # 看这集实际用的是哪张表
+```
+
+- **为什么要这一层**：v0.5 之前"角色名只能来自 bible/manifest/台词"是**叮嘱**，没有检查器兜底，实测必然失败（写作者把被称呼者"茉里"当成说话人并据此改判声学归属）。现在命名权在人手里，成稿由机器强制。
+- **三道强制闸门（致命项都有反例测试）**：① `resolve_cast.py` 永不产出名字——簇只能进槽位，`slots → entities` 必须有 `approved_by: "human"` 记录；② §4.1 三级匹配（**只用正证据、至少两族、含糊即新建 pending**，因为过度合并会被后续每一集继承、不可逆）；③ `splice_screenplay.py` 表外专名**退出码 9**（无表可查时降为告警并在成稿标注，见下）。
+- **🔴 检查点（必须问用户，`pending` 为空则不问）**：阶段 3.7/3.8 跑完后打印候选表并问：
+  > 本集识别出 N 个说话人：已定名 x 个（沿用系列演员表）、待你定名 y 个、无法判定 z 个。
+  > 现在定名，还是先出草稿（成稿会标注"演员表未经核验"）？
+
+  一轮最多 4 个槽位，**问完问"后面还有 y 个，继续吗？"**——不是"只许问 4 个、剩下算未定名"。
+- **回话必须解析成五种结局之一**：明确对应候选 → 写盘 + 回显 diff；提到表外新名字 → **不写**、回问确认；按位置指代（"第二个"）→ 回显解析出的槽位号请确认；完全解析不出 → 重打表 + 给可改的行内模板；用户对 diff 说"不对" → 整轮不写（写盘是原子替换，不存在半条记录）。**绝不静默跳过、绝不部分写入**。
+- **`--draft` 降级语义**：未绑定系列或用户不签核也能出稿，但成稿**头部表**里必须出现 `⚠️ 演员表未经核验（N 个槽位为候选）`（不是只写在附录——附录是读者最先跳过的地方）。理由：没有降级通道，人就会为了省事绕过流程，表反而形同虚设。
+- **呼语的单向性**：台词里的人名是**被称呼者**。它只能作为①某槽位的命名候选、②"说这句话的簇不是他"的负证据；**永远不能**用来判定"这句话是谁说的"（`vocatives.py` 的 `role` 枚举里根本没有这个值，测试钉住）。
+- **描述性标签不等于失败**：`女声`／`系统音`／`面试的店主` 一律放行（形状判定），但会被计数进成稿的"说话人标签构成"——一集里描述性标签多，说明演员表没做完，而不是写作者不乖。
+- 跳过本阶段 = 全部走 `--draft` 标注，流水线其余不受影响。
+
 ### 阶段 4 —— 场景写作（由 LLM 撰写真正的剧本，分块可续跑）
 
 ```bash
@@ -203,6 +229,7 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 - 组装整集文档：元数据头（字幕来源、镜头/场景计数）、场次总表、拼装后的各场、附录（声画关系统计 + 保真报告）。
 - 输出：`output/<标题>_影视文学剧本.md`。配置了 OP/ED 窗口时，成稿在相应位置只含一行 **（动画 OP）/（动画 ED）** 标注（窗口内仍留有压边台词的场按普通场景撰写，并在场头下方加同一行标注），保真报告记录被过滤的行数与窗口明细。
 - 🛑 **停下复查**：splice 退出码 0 且 `dialogue_spliced == dialogue_total`；确认所有 lint 告警已知晓；交付物在 `output/`，项目根目录无散落文件，最终 `.md` 中零 `SPEAKER_` 字符串。
+- 🛑 **命名复查（v0.6）**：成稿头部「演员表」一行写的是「已签核」而非「⚠️ 未核验」；若为未核验，必须是**用户明确选择**先出稿，而不是这一阶段被悄悄跳过；正文里每一个专名说话人都能在 `cast.approved.json` 查到 `approved_by: "human"` 的记录。
 
 ---
 
@@ -235,6 +262,11 @@ python3 scripts/splice_screenplay.py --workspace "<ws>" --title "第 N 话 …"
 | 关键帧抓取失败 | `failed_keyframes[]`（shots.json → scenes.json → aligned_timeline 全程透传） | 无已验证帧的场在时间线里 `visual_verified: false`；草稿不得描写它们 |
 | 场景文本缺失/不完整 | splice 致命错误并点名下标 | 写作 pass 必须让每条字幕恰好覆盖一次后才能成稿 |
 | 叙事大纲未写 | narrative_outline 退出码 6 | 可选层：按工作单补 `narrative_structure.json`，或直接以平切继续 |
+| **成稿出现表外专名说话人** | splice **退出码 9** 并逐个点名 | 演员表闸门在生效：回阶段 3.8 签核该槽位，或（用户明确同意先出稿）解除系列绑定走 `--draft` 标注。**绝不**为了过闸门往 bible.json 里塞名字 |
+| 说话人全是描述性标签（`女声`／`系统音`／`面试的店主`） | 成稿「说话人标签构成」里描述性占比高 | 不是错误，是演员表没做完：把 pending 槽位问完再定名 |
+| `resolve_cast.py` 有 `pending` 但无人签核 | cast.json 的 `abstention.rate` | 成稿头部会标 ⚠️ 未核验；用户选择跳过即可继续，**不得由 agent 代为定名** |
+| 演员表无处可写 | cast_signoff **退出码 3**（未绑定系列） | `workspace.py series --workspace <ws> --bind <系列根>` 后重试 |
+| 视觉族不参与判定 | av_notes 的 `mouth_compliance.usable=false` | 提示词遵从未达标（或还没有 v3 产物）：按设计文档 §10 P3 降级为只做拼接视频探测，别把「没测出」当「没人说话」 |
 
 ---
 

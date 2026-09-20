@@ -176,6 +176,38 @@ class TestAddressNegativeEvidence(unittest.TestCase):
         self.assertEqual(doc["clusters"][0]["not_speaker"], ["茉里"])
 
 
+class TestSignOffClosesTheLoop(unittest.TestCase):
+    """cast_signoff records {kind: signoff, cluster_id} with approved_by: human.
+    Honouring that record is the only legal route by which a slot created in this
+    episode can carry a name - without it the sign-off would evaporate on the
+    next resolve, and the writer would be back to guessing."""
+
+    SIGNED = {"entities": [{
+        "id": "C7", "canonical_name": "托德", "status": "approved", "aliases": [],
+        "voice_profile": {}, "visual_anchors": [], "approved_by": "human",
+        "approved_at": "2026-09-20",
+        "evidence": [{"kind": "signoff", "cluster_id": "SPEAKER_A1", "slot_id": "S3"}]}]}
+
+    def test_a_signed_cluster_becomes_named_and_stops_being_pending(self):
+        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN,
+                        "SPEAKER_A2": CLUSTER_UNKNOWN}, approved=self.SIGNED)
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        by_cluster = {c["cluster_id"]: c["assignment"] for c in doc["clusters"]}
+        self.assertEqual(by_cluster["SPEAKER_A1"]["status"], "approved")
+        self.assertEqual(by_cluster["SPEAKER_A1"]["matched_via"], "human_signoff")
+        self.assertEqual(by_cluster["SPEAKER_A1"]["entity_name"], "托德")
+        self.assertEqual(by_cluster["SPEAKER_A2"]["status"], "unknown")
+        self.assertEqual([p["cluster_id"] for p in doc["pending"]], ["SPEAKER_A2"],
+                         "the unsigned cluster stays a question")
+
+    def test_a_name_with_no_signoff_record_is_still_rejected(self):
+        doc = resolve_cast.resolve(Path("/tmp"), _evidence({"SPEAKER_A1": CLUSTER_UNKNOWN}))
+        created = next(s for s in doc["slots"] if s["origin"] == "this_episode")
+        created["entity_id"] = "C7"
+        with self.assertRaises(AssertionError):
+            resolve_cast._assert_no_forged_names(doc)
+
+
 class TestArtifactAndGuards(unittest.TestCase):
     def _ws(self, root: Path):
         ws = root / "episodes" / "ep02"

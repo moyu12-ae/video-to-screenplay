@@ -402,7 +402,14 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
                                 candidates=candidates, families=families, margin=margin)
 
     status = next((s.get("status") for s in slots if s["slot_id"] == winner), "pending")
+    winner_slot = next((s for s in slots if s["slot_id"] == winner), {})
     return {
+        # The lineage the naming gate checks: this cluster, this slot, and the
+        # signed-off entity behind it. A name that is merely PRESENT in the table
+        # is not lineage - that distinction is what catches the ep02 accident
+        # (茉里 is a real character; A1 was never signed off as her).
+        "entity_id": winner_slot.get("entity_id"),
+        "entity_name": _entity_name(ev["approved"], winner_slot.get("entity_id")),
         "slot_id": winner,
         "status": "approved" if status == "approved" else "candidate",
         "matched_via": "approved_slot" if status == "approved" else "pending_slot",
@@ -455,6 +462,16 @@ def _new_slot_result(cluster_id: str, cluster: Dict[str, Any], why: str,
 def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
     approved = ev["approved"]
     """Fold every cluster into a slot under §4.1 and emit the cast document."""
+    # A sign-off record is how a name gets back into the loop: cast_signoff writes
+    # {kind: "signoff", cluster_id, slot_id} with approved_by: "human", and honoring
+    # it is the ONLY way a slot created in this episode can carry an entity.
+    signoffs: Dict[str, Dict[str, Any]] = {}
+    for entity in approved.get("entities") or []:
+        if not isinstance(entity, dict) or str(entity.get("status") or "").lower() != "approved":
+            continue
+        for record in entity.get("evidence") or []:
+            if isinstance(record, dict) and record.get("kind") == "signoff" and record.get("cluster_id"):
+                signoffs[str(record["cluster_id"])] = entity
     slots = slots_from_approved(approved, ev.get("visual"))
     entities = [dict(e) for e in (approved.get("entities") or []) if isinstance(e, dict)]
     assignments: List[Dict[str, Any]] = []
@@ -478,8 +495,19 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
                 "origin": "this_episode",
             })
             result["slot_id"] = slot_id
-            pending.append({"slot_id": slot_id, "cluster_id": cluster_id,
-                            "reason": result["reason"]})
+            signed = signoffs.get(cluster_id)
+            if signed:
+                slots[-1]["entity_id"] = signed.get("id")
+                slots[-1]["status"] = "approved"
+                result["status"] = "approved"
+                result["matched_via"] = "human_signoff"
+                result["entity_id"] = signed.get("id")
+                result["entity_name"] = str(signed.get("canonical_name") or "") or None
+                result["basis"] = list(result.get("basis") or []) + [
+                    f"human sign-off record on {cluster_id} -> {result['entity_name']}"]
+            else:
+                pending.append({"slot_id": slot_id, "cluster_id": cluster_id,
+                                "reason": result["reason"]})
         visual_top = None
         if visual_votes_by_cluster.get(cluster_id):
             visual_top = max(visual_votes_by_cluster[cluster_id].items(),
@@ -487,9 +515,9 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
         assignments.append({
             "cluster_id": cluster_id,
             "visual_top_slot": visual_top,
-            "assignment": {k: result[k] for k in
+            "assignment": {k: result.get(k) for k in
                            ("slot_id", "status", "matched_via", "candidates", "margin",
-                            "families_supporting", "basis")},
+                            "families_supporting", "basis", "entity_id", "entity_name")},
             # Ruled-out names travel with the cluster on every path, including
             # the new-slot path - a human reading `pending` needs to see that the
             # cluster already cannot BE the person it addressed.
@@ -550,12 +578,19 @@ def _assert_no_forged_names(doc: Dict[str, Any]) -> None:
         if entity.get("approved_by") != "human" or not entity.get("approved_at"):
             raise AssertionError(
                 f"entity {entity.get('id')!r} carries a name without a human sign-off record")
+    signed_clusters = {c["cluster_id"] for c in doc["clusters"]
+                       if c["assignment"].get("matched_via") == "human_signoff"}
     for assignment in doc["clusters"]:
         slot = named_slots.get(assignment["assignment"]["slot_id"])
-        if slot and slot.get("entity_id") and slot.get("origin") != "approved_table":
-            raise AssertionError(
-                f"slot {slot['slot_id']} has an entity_id but was not seeded from the "
-                "approved table - the resolver must never name a slot it created")
+        if not slot or not slot.get("entity_id"):
+            continue
+        if slot.get("origin") == "approved_table":
+            continue
+        if assignment["cluster_id"] in signed_clusters:
+            continue  # a human attached this name to this cluster; that is legal
+        raise AssertionError(
+            f"slot {slot['slot_id']} has an entity_id but was not seeded from the approved "
+            "table and carries no human sign-off record - the resolver must never name a slot")
 
 
 def build_evidence(ws: Path) -> Dict[str, Any]:

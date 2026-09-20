@@ -210,7 +210,8 @@ def load_approved(workspace: Optional[str | Path]) -> Dict[str, Any]:
     if snap and snap.get("sha256") and merged.get("version") != "draft":
         if snap["sha256"] != sha256_of(src):
             _warn(f"series cast table changed after this workspace was bound "
-                  f"(snapshot version {snap.get('version')} -> current {merged.get('version')}); "
+                  f"(snapshot {str(snap['sha256'])[:12]}… version {snap.get('version')}, "
+                  f"current {sha256_of(src)[:12]}… version {merged.get('version')}); "
                   f"re-run 'workspace.py series --bind' or 'resolve_cast.py --refresh-snapshot' "
                   f"to make the change explicit")
     return merged
