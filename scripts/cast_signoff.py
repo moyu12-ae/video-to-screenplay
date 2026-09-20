@@ -79,6 +79,8 @@ def pending_slots(cast_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
                     # Shown so a human cannot re-commit the original mistake: this
                     # cluster spoke lines ADDRESSING these people, so it is not them.
                     "ruled_out": excluded,
+                    "visual_votes": (entry.get("visual_votes") or {}) if isinstance(entry, dict) else {},
+                    "visual_trusted": bool(entry.get("visual_trusted")) if isinstance(entry, dict) else False,
                     "reason": (entry.get("reason") if isinstance(entry, dict) else "") or ""})
     return out
 
@@ -135,6 +137,12 @@ def render_table(slots: List[Dict[str, Any]]) -> str:
         ruled = slot.get("ruled_out") or []
         if ruled:
             cands += f"（不是 {'、'.join(ruled)}——这簇台词里在叫他们）"
+        votes = slot.get("visual_votes") or {}
+        if votes:
+            seen = "、".join(f"{k}×{v}" for k, v in sorted(votes.items(), key=lambda kv: -kv[1])[:3])
+            desc += f"｜说话期间动嘴的画像：{seen}"
+            if not slot.get("visual_trusted"):
+                desc += "（该信道未过 P3 遵从门，仅供你目视核对）"
         rows.append(f"| {slot['slot_id']} | {desc} | {cands} | {slot.get('reason') or '新出现'} |")
     return "\n".join(rows)
 

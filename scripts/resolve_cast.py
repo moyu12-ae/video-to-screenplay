@@ -162,6 +162,46 @@ def visual_evidence(av_doc: Any) -> Dict[str, Any]:
                     "the visual family contributes no votes and cannot satisfy §4.1"}
 
 
+def cluster_visual_votes(speakers_doc: Any, av_doc: Any) -> Dict[str, Dict[str, int]]:
+    """Per-cluster visual positives, taken from THAT cluster's speech windows.
+
+    This is the shape the design asked for: to ask whether A1 is the blond young
+    man, evaluate the frames where A1 is speaking and nobody else's. Aggregating
+    mouth evidence over the whole episode instead would let a person talking in
+    another cluster vote for this one, and would make the over-split audit
+    ("two clusters, same face") impossible to compute at all.
+    """
+    actions: List[Dict[str, Any]] = []
+    for note in ((av_doc or {}).get("scene_notes") or []) if isinstance(av_doc, dict) else []:
+        if not isinstance(note, dict):
+            continue
+        for seg in note.get("segments") or []:
+            if not isinstance(seg, dict):
+                continue
+            actions.extend(a for a in ((seg.get("visual") or {}).get("actions") or [])
+                           if isinstance(a, dict))
+    turns = [t for t in ((speakers_doc or {}).get("speech_turns") or [])
+             if isinstance(t, dict)] if isinstance(speakers_doc, dict) else []
+    out: Dict[str, Dict[str, int]] = {}
+    for turn in turns:
+        cluster = str(turn.get("cluster_id") or "")
+        if not cluster:
+            continue
+        t0, t1 = int(turn.get("start_ms", 0)), int(turn.get("end_ms", 0))
+        for action in actions:
+            if str(action.get("mouth_state")) != "moving":
+                continue
+            a0, a1 = int(action.get("start", 0)), int(action.get("end", 0))
+            if min(t1, a1) - max(t0, a0) <= 0:
+                continue
+            label = str(action.get("who") or "").strip()
+            if not label:
+                continue
+            bucket = out.setdefault(cluster, {})
+            bucket[label] = bucket.get(label, 0) + 1
+    return out
+
+
 
 # --------------------------------------------------------------------------
 # P4: same-base distributions and their merge
@@ -244,7 +284,9 @@ def acoustic_distribution(cluster: Dict[str, Any], slots: List[Dict[str, Any]]
 
 
 def visual_distribution(slots: List[Dict[str, Any]], anchors: Dict[str, Any],
-                        clips_total: int, available: bool) -> Tuple[Dict[str, float], float]:
+                        clips_total: int, available: bool,
+                        cluster_votes: Optional[Dict[str, int]] = None
+                        ) -> Tuple[Dict[str, float], float]:
     """Per-slot count of clips where that slot's own label was seen talking.
 
     `still` and `not_visible` are deliberately absent: under limited animation a
@@ -252,7 +294,8 @@ def visual_distribution(slots: List[Dict[str, Any]], anchors: Dict[str, Any],
     """
     if not available:
         return {}, 0.0
-    positive = (anchors or {}).get("positive_by_anchor") or {}
+    positive = cluster_votes if cluster_votes is not None \
+        else ((anchors or {}).get("positive_by_anchor") or {})
     counts: Dict[str, float] = {}
     seen = 0.0
     for slot in slots:
@@ -365,7 +408,8 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
     ac_counts, ac_unobserved = acoustic_distribution(cluster, eligible)
     vis_counts, vis_unobserved = visual_distribution(
         eligible, visual.get("anchors") or {}, int(visual.get("clips_total") or 0),
-        bool(visual.get("available")))
+        bool(visual.get("available")),
+        (visual.get("by_cluster") or {}).get(cluster_id))
 
     distributions = {
         "acoustic": normalize_distribution(ac_counts, ac_unobserved),
@@ -452,6 +496,7 @@ def _new_slot_result(cluster_id: str, cluster: Dict[str, Any], why: str,
         "basis": [why],
         "new_slot_profile": {k: cluster.get(k, "unknown") for k in ("gender", "age_band", "timbre")},
         "reason": why,
+        "visual_votes_this_cluster": {},
     }
 
 
@@ -507,7 +552,15 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
                     f"human sign-off record on {cluster_id} -> {result['entity_name']}"]
             else:
                 pending.append({"slot_id": slot_id, "cluster_id": cluster_id,
-                                "reason": result["reason"]})
+                                "reason": result["reason"],
+                                # What the user should actually look at: who was seen
+                                # talking during THIS cluster's speech windows. Shown
+                                # even when the channel is downgraded, because a human
+                                # reading "chewing" next to "moving" is exactly how that
+                                # confounder gets caught.
+                                "visual_votes": dict((ev["visual"].get("by_cluster") or {})
+                                                     .get(cluster_id) or {}),
+                                "visual_trusted": bool(ev["visual"].get("available"))})
         visual_top = None
         if visual_votes_by_cluster.get(cluster_id):
             visual_top = max(visual_votes_by_cluster[cluster_id].items(),
@@ -603,11 +656,17 @@ def build_evidence(ws: Path) -> Dict[str, Any]:
     if isinstance(manifest, dict):
         known += [str(n) for n in (manifest.get("bible_names") or []) if str(n).strip()]
         known += [str(n) for n in (manifest.get("characters_manifest") or {}) if str(n).strip()]
+    visual = visual_evidence(av_doc)
+    # Pending slots have no signed-off visual_label yet, so per-cluster votes cannot
+    # attach to anything: on episode one the visual family is structurally unable to
+    # vote, which is why the sign-off sheet must show the user what each cluster was
+    # seen doing rather than pretending a distribution exists.
+    visual["by_cluster"] = cluster_visual_votes(speakers_doc, av_doc)
     return {
         "approved": approved,
         "acoustic": acoustic_evidence(speakers_doc),
         "address": address_evidence(aligned_doc, sorted(set(known))),
-        "visual": visual_evidence(av_doc),
+        "visual": visual,
     }
 
 

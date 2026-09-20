@@ -83,6 +83,47 @@ class TestComplianceGate(unittest.TestCase):
         self.assertIn("contributes no votes", ev["note"])
 
 
+class TestPerClusterWindowing(unittest.TestCase):
+    """The design's own words: to ask whether A1 is the blond young man, evaluate
+    the frames where A1 speaks - not the episode. Global aggregation would let a
+    person talking during someone else's line vote here, and would make the
+    over-split audit uncomputable."""
+
+    SPEAKERS = {"speech_turns": [
+        {"cluster_id": "SPEAKER_A1", "start_ms": 0, "end_ms": 2000},
+        {"cluster_id": "SPEAKER_A1", "start_ms": 3000, "end_ms": 4000},
+        {"cluster_id": "SPEAKER_A2", "start_ms": 6000, "end_ms": 7000}]}
+
+    def test_votes_follow_each_cluster_windows(self):
+        actions = [{"start": 1000, "end": 1500, "who": "金发青年", "mouth_state": "moving"},
+                   {"start": 6200, "end": 6600, "who": "老年女性", "mouth_state": "moving"},
+                   {"start": 3500, "end": 3900, "who": "金发青年", "mouth_state": "still"},
+                   {"start": 9000, "end": 9500, "who": "路人", "mouth_state": "moving"}]
+        votes = resolve_cast.cluster_visual_votes(self.SPEAKERS, _note(actions))
+        self.assertEqual(votes, {"SPEAKER_A1": {"金发青年": 1},
+                                 "SPEAKER_A2": {"老年女性": 1}},
+                         "still must not vote, and a window outside every turn votes for nobody")
+
+    def test_a_downgraded_channel_still_reports_to_the_human(self):
+        """The sheet shows untrusted votes on purpose: a person reading "chewing"
+        next to "mouth moving" is how the mastication confounder gets caught."""
+        actions = [{"start": 1000, "end": 1500, "who": "黑发少女", "mouth_state": "moving"}]
+        doc = resolve_cast.resolve(Path("/tmp"), {
+            "approved": {},
+            "acoustic": {"SPEAKER_A1": {"gender": "unknown", "age_band": "unknown",
+                                        "timbre": "unknown", "speech_ms": 1,
+                                        "line_count": 1, "named": False}},
+            "address": {"events": [], "terms": {}, "not_speaker": {}},
+            "visual": dict(resolve_cast.visual_evidence(_note(actions, compliance={"usable": False})),
+                           by_cluster=resolve_cast.cluster_visual_votes(
+                               {"speech_turns": [{"cluster_id": "SPEAKER_A1",
+                                                  "start_ms": 0, "end_ms": 2000}]},
+                               _note(actions)))})
+        entry = doc["pending"][0]
+        self.assertEqual(entry["visual_votes"], {"黑发少女": 1})
+        self.assertFalse(entry["visual_trusted"])
+
+
 class TestResolverConsumption(unittest.TestCase):
     ACTIONS = [{"start": 0, "end": 1_500, "who": "金发青年", "what": "说话", "mouth_state": "moving"},
                {"start": 2_000, "end": 3_400, "who": "金发青年", "what": "回头", "mouth_state": "still"},
