@@ -258,6 +258,23 @@ def lint_speaker_names(spliced_texts: List[str], allowed: set,
     return [f"未登记的说话人名称（请核对是否杜撰）: {listed}"]
 
 
+def summarize_cast(cast_doc: Dict[str, Any]) -> Dict[str, Any]:
+    """named / candidate / unknown per cluster, plus the resolver's own caveats."""
+    statuses = [str((c.get("assignment") or {}).get("status") or "unknown")
+                for c in (cast_doc.get("clusters") or []) if isinstance(c, dict)]
+    gates = cast_doc.get("gates") or {}
+    abstention = cast_doc.get("abstention") or {}
+    return {
+        "named": statuses.count("approved"),
+        "candidate": statuses.count("candidate"),
+        "unknown": statuses.count("unknown"),
+        "abstention_rate": abstention.get("rate"),
+        "over_split_suspects": len(cast_doc.get("over_split_suspects") or []),
+        "thresholds_are_measured": bool(gates.get("thresholds_are_measured")),
+        "cast_version": cast_doc.get("table_version") or cast_doc.get("version"),
+    }
+
+
 def _cell(value: Any) -> str:
     """Markdown table cell: escape pipes so titles like 【A|B】 cannot break the row."""
     return str(value or "").replace("|", "\\|").replace("\n", " ")
@@ -360,6 +377,12 @@ def main():
     naming_warnings = lint_speaker_names(spliced_texts, allowed_names, cast_enforced=cast_enforced)
     warnings += naming_warnings
     label_buckets = audit_speaker_labels(spliced_texts, allowed_names)
+    # The machine's own uncertainty belongs in the deliverable, not just in a
+    # scratch file: an episode where the resolver abstained on most speakers is not
+    # "done, with warnings", and the reader needs to see that before trusting a
+    # name that appears in the text.
+    cast_doc = load_json(ws / ".cache" / "cast" / "cast.json")
+    cast_summary = summarize_cast(cast_doc) if isinstance(cast_doc, dict) else None
 
     title = args.title or ws.name
     safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
@@ -408,6 +431,19 @@ def main():
         f"本次拼装 {spliced_count}/{len(verbatim)} 条，覆盖率 {spliced_count / max(1, len(verbatim)):.1%}；"
         "台词文本未经过任何改写。\n"
         ">\n"
+        ">\n"
+        + (
+            f"> **演员表状态**：已定名 {cast_summary['named']} 簇、候选 "
+            f"{cast_summary['candidate']} 簇、未定名 {cast_summary['unknown']} 簇"
+            + (f"，弃权率 {cast_summary['abstention_rate']:.0%}"
+               if isinstance(cast_summary.get('abstention_rate'), float) else "")
+            + (f"，疑似过度切分 {cast_summary['over_split_suspects']} 组"
+               if cast_summary["over_split_suspects"] else "")
+            + ("；判定阈值**尚未经测量**。" if not cast_summary["thresholds_are_measured"]
+               else "；阈值来自测量。")
+            + f"（表版本 {cast_summary['cast_version'] or '未签核'}）\n"
+        ) if cast_summary else ""
+        +
         f"> **说话人标签构成**：可溯源 {len(label_buckets['named'])} 个、"
         f"描述性（未定名）{len(label_buckets['descriptive'])} 个、"
         f"表外专名 {len(label_buckets['untraced'])} 个"

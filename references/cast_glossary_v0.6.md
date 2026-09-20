@@ -490,7 +490,14 @@ A3 (6)            → 黑发×1、红发×1（平票）   静默负对照(2) →
    **未测**：本机当前拿不到 `DASHSCOPE_API_KEY`（launchd 未设置、shell 快照也不带），所以 §13 要求的
    `mouth_state` 合法率与 ≤3 秒遵从率**还没有真实数字**，通道因此自动处于降级态（不参与判定）。
    跑一次 30 秒素材的 AV pass 即可拿到，需要 key 与你的付费授权。
-5. **P4 候选分布合并 + margin 判定 + 过切分审计 + 保真报告接入**。
+5. **P4 候选分布合并 + margin 判定 + 过切分审计 + 保真报告接入** ✅ **已落地**
+   （`normalize_distribution`（`not_observed` 进分母不进分子、全零族剔除）、
+   `merge_distributions`（对数域加权几何平均，某族的"确信为零"直接淘汰候选——这就是"缩小候选集"的算式形状）、
+   `distribution_margin = (top1-top2)/Σ`（1 vs 1 平票恒为 0，与观测条数无关）、
+   弃权时**候选集仍然写进 `cast.json`**（"是这两个人之一"是信息不是失败）、
+   过切分反向审计 `over_split_suspects`（并显式声明欠切分不可见）、
+   `abstention.rate` 与 `gates.thresholds_are_measured=false` 一起进成稿的保真报告）。
+   **各族权重目前恒为 1.0**：§11.7 要求视觉族权重来自测量，测量需要 §13 的人工真值窗口，尚未做。
 6. **P5 签核界面**（Markdown 表 + 自然语言回话 + diff 确认，见 §4.5）+ `--draft` 语义 +
    SKILL/README/SECURITY 三处文档 + 联网校正的人工确认流程。
 

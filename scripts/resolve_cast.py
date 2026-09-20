@@ -52,6 +52,11 @@ MIN_FAMILIES_FOR_AUTO_MATCH = 2
 # the design doc's §13 requires precision/recall on labelled windows before any
 # threshold here is presented as validated.
 AUTO_MATCH_MIN_MARGIN = 0.34
+# Equal weights on purpose: the design doc's §11.7 says the visual family's weight
+# must come from measured precision/recall, and there is no such number yet. Equal
+# weighting is the honest neutral, and `thresholds_are_measured: false` travels with
+# every document produced under it.
+FAMILY_WEIGHTS: Dict[str, float] = {family: 1.0 for family in FAMILIES}
 
 
 def _load(ws: Path, rel: str) -> Any:
@@ -157,6 +162,107 @@ def visual_evidence(av_doc: Any) -> Dict[str, Any]:
                     "the visual family contributes no votes and cannot satisfy §4.1"}
 
 
+
+# --------------------------------------------------------------------------
+# P4: same-base distributions and their merge
+# --------------------------------------------------------------------------
+
+def normalize_distribution(counts: Dict[str, float], unobserved: float) -> Dict[str, float]:
+    """p_f(x) = n_f(x) / (SUM_y n_f(y) + u_f).
+
+    `unobserved` goes in the DENOMINATOR and never the numerator: a window where
+    nothing could be seen flattens this family's distribution - i.e. it reduces
+    how much this family is allowed to say - instead of voting against anybody.
+    A family with no observations at all returns {} so it is dropped from the
+    merge entirely; multiplying by an all-zero distribution would zero every
+    candidate and leave the margin as 0/0.
+    """
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return {}
+    denom = total + max(0.0, float(unobserved))
+    return {k: v / denom for k, v in counts.items() if v > 0}
+
+
+def merge_distributions(distributions: Dict[str, Dict[str, float]],
+                        weights: Dict[str, float]) -> Dict[str, float]:
+    """score(x) = PRODUCT_f p_f(x) ** w_f, i.e. a weighted sum in log space.
+
+    A candidate a family does not mention gets p=0 for that family, which is what
+    "narrow the candidate set" means operationally: one family's confident zero
+    takes a candidate out of the running, while its silence (an absent family)
+    does not. Weights are equal until §11.7's measurement lands - and that
+    honest-default is exactly why `thresholds_are_measured` ships as False.
+    """
+    candidates = set()
+    for dist in distributions.values():
+        candidates |= set(dist)
+    scores: Dict[str, float] = {}
+    for cand in candidates:
+        score = 1.0
+        for family, dist in distributions.items():
+            weight = float(weights.get(family, 1.0))
+            score *= float(dist.get(cand, 0.0)) ** weight
+        scores[cand] = score
+    return scores
+
+
+def distribution_margin(scores: Dict[str, float]) -> Tuple[float, List[str]]:
+    """margin = (top1 - top2) / SUM, plus the ranked candidates.
+
+    Dividing by the total rather than by top1 keeps a flat 1-vs-1 tie at 0 no
+    matter how many observations there were; a large absolute lead that is only
+    half the mass still reads as weak, which is the point.
+    """
+    ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))
+    total = sum(scores.values())
+    if not ranked or total <= 0:
+        return 0.0, [k for k, _ in ranked]
+    top = ranked[0][1]
+    second = ranked[1][1] if len(ranked) > 1 else 0.0
+    return (top - second) / total, [k for k, _ in ranked]
+
+
+def acoustic_distribution(cluster: Dict[str, Any], slots: List[Dict[str, Any]]
+                          ) -> Tuple[Dict[str, float], float]:
+    """Per-slot count of attributes both sides actually report and agree on."""
+    counts: Dict[str, float] = {}
+    unobserved = 0.0
+    for slot in slots:
+        profile = slot.get("profile") or {}
+        agree = 0
+        for field in ("gender", "age_band", "timbre"):
+            verdict = _compatible(str(cluster.get(field) or "unknown"),
+                                  str(profile.get(field) or "unknown"))
+            if verdict is True:
+                agree += 1
+            elif verdict is None:
+                unobserved += 1
+        if agree:
+            counts[str(slot["slot_id"])] = float(agree)
+    return counts, unobserved
+
+
+def visual_distribution(slots: List[Dict[str, Any]], anchors: Dict[str, Any],
+                        clips_total: int, available: bool) -> Tuple[Dict[str, float], float]:
+    """Per-slot count of clips where that slot's own label was seen talking.
+
+    `still` and `not_visible` are deliberately absent: under limited animation a
+    closed mouth over one second proves little, and an unseen face proves nothing.
+    """
+    if not available:
+        return {}, 0.0
+    positive = (anchors or {}).get("positive_by_anchor") or {}
+    counts: Dict[str, float] = {}
+    seen = 0.0
+    for slot in slots:
+        label = slot.get("visual_label")
+        hits = int(positive.get(label, 0) or 0) if label else 0
+        seen += hits
+        if hits:
+            counts[str(slot["slot_id"])] = float(hits)
+    return counts, float(max(0, int(clips_total) - int(seen)))
+
 # --------------------------------------------------------------------------
 # slots, and the §4.1 three-tier match
 # --------------------------------------------------------------------------
@@ -246,51 +352,67 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
                   ev: Dict[str, Any]) -> Dict[str, Any]:
     """§4.1: ① approved slot → ② pending slot → ③ brand-new slot.
 
-    ① and ② both require >=2 supporting families and a margin over the runner-up;
-    anything else is ambiguity, and ambiguity creates a pending slot instead of
-    merging - a wrong merge is inherited by every later episode.
+    ① and ② both require >=2 supporting families and a clear margin on the merged
+    distribution; anything else is ambiguity, and ambiguity creates a pending slot
+    instead of merging - a wrong merge is inherited by every later episode.
     """
     not_speaker = ev["address"].get("not_speaker") or {}
-    anchors = ev["visual"]["anchors"]
-    entity_by_slot = {s["slot_id"]: s.get("entity_id") for s in slots}
-    scored: List[Tuple[float, str, List[str], List[str]]] = []
-    for slot in slots:
-        entity_name = _entity_name(ev["approved"], entity_by_slot.get(slot["slot_id"]))
-        if entity_name and entity_name in (not_speaker.get(cluster_id) or []):
-            continue  # this cluster spoke a line addressing them: ruled out, not scored
-        families, reasons = family_support(cluster, slot, anchors, entity_name,
-                                            anchors_available=bool(ev["visual"].get("available")))
-        if not families:
-            continue
-        scored.append((len(families) + _exact_attribute_bonus(cluster, slot),
-                       slot["slot_id"], families, reasons))
+    ruled_out = set(not_speaker.get(cluster_id) or [])
+    entity_of = {s["slot_id"]: _entity_name(ev["approved"], s.get("entity_id")) for s in slots}
+    eligible = [s for s in slots if not (entity_of.get(s["slot_id"]) and
+                                         entity_of[s["slot_id"]] in ruled_out)]
+    visual = ev["visual"]
+    ac_counts, ac_unobserved = acoustic_distribution(cluster, eligible)
+    vis_counts, vis_unobserved = visual_distribution(
+        eligible, visual.get("anchors") or {}, int(visual.get("clips_total") or 0),
+        bool(visual.get("available")))
 
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    if not scored:
-        return _new_slot_result(cluster_id, cluster, "no slot has any positive evidence")
-    top_score, top_slot, families, reasons = scored[0]
-    runner = scored[1][0] if len(scored) > 1 else 0
-    margin = (top_score - runner) / max(1.0, top_score)
+    distributions = {
+        "acoustic": normalize_distribution(ac_counts, ac_unobserved),
+        "visual": normalize_distribution(vis_counts, vis_unobserved),
+    }
+    distributions = {f: d for f, d in distributions.items() if d}
+    if not distributions:
+        return _new_slot_result(cluster_id, cluster,
+                                "no slot has any positive evidence"
+                                + (f"; {len(slots) - len(eligible)} slot(s) ruled out by 呼语"
+                                   if len(eligible) != len(slots) else ""))
+
+    scores = merge_distributions(distributions, FAMILY_WEIGHTS)
+    margin, ranked = distribution_margin(scores)
+    winner = ranked[0]
+    families = sorted(f for f, dist in distributions.items() if dist.get(winner, 0) > 0)
+    reasons = []
+    if distributions.get("acoustic"):
+        reasons.append("acoustic attributes agreed with " + ", ".join(
+            s["slot_id"] for s in eligible if ac_counts.get(str(s["slot_id"]))))
+    if distributions.get("visual"):
+        reasons.append("visual mouth evidence on that slot's own label")
+    candidates = {slot_id: round(scores[slot_id], 4) for slot_id in ranked if scores[slot_id] > 0}
+
     if len(families) < MIN_FAMILIES_FOR_AUTO_MATCH:
         return _new_slot_result(cluster_id, cluster,
-                                f"only {len(families)} family supports {top_slot}; "
-                                "single-family auto-merge is forbidden (§4.1)")
+                                f"only {len(families)} family supports {winner}; "
+                                "single-family auto-merge is forbidden (§4.1)",
+                                candidates=candidates, families=families, margin=margin)
     if margin < AUTO_MATCH_MIN_MARGIN:
         return _new_slot_result(cluster_id, cluster,
-                                f"{top_slot} vs next by margin {margin:.2f} < "
-                                f"{AUTO_MATCH_MIN_MARGIN} - ambiguous, keep separate")
-    status = next((s.get("status") for s in slots if s["slot_id"] == top_slot), "pending")
+                                f"{winner} vs next by margin {margin:.2f} < "
+                                f"{AUTO_MATCH_MIN_MARGIN} - ambiguous, keep separate",
+                                candidates=candidates, families=families, margin=margin)
+
+    status = next((s.get("status") for s in slots if s["slot_id"] == winner), "pending")
     return {
-        "slot_id": top_slot,
+        "slot_id": winner,
         "status": "approved" if status == "approved" else "candidate",
         "matched_via": "approved_slot" if status == "approved" else "pending_slot",
-        "candidates": {top_slot: top_score},
+        "candidates": candidates,
         "margin": round(margin, 3),
-        "families_supporting": sorted(set(families)),
+        "families_supporting": families,
         "basis": reasons + [f"cluster {cluster_id} attributes: "
                             + ", ".join(f"{k}={cluster.get(k)}"
                                         for k in ("gender", "age_band", "timbre"))],
-        "not_speaker": sorted(not_speaker.get(cluster_id) or []),
+        "visual_votes": dict(distributions.get("visual") or {}),
     }
 
 
@@ -309,10 +431,17 @@ def _entity_name(approved: Dict[str, Any], entity_id: Optional[str]) -> Optional
     return None
 
 
-def _new_slot_result(cluster_id: str, cluster: Dict[str, Any], why: str) -> Dict[str, Any]:
+def _new_slot_result(cluster_id: str, cluster: Dict[str, Any], why: str,
+                     candidates: Optional[Dict[str, float]] = None,
+                     families: Optional[List[str]] = None,
+                     margin: float = 0.0) -> Dict[str, Any]:
     return {
+        # The narrowed candidate set survives even when the cluster gets its own
+        # slot: "it is one of these two" is the information the evidence actually
+        # carries, and dropping it would throw away the channel's whole value.
         "slot_id": None, "status": "unknown", "matched_via": "new_slot",
-        "candidates": {}, "margin": 0.0, "families_supporting": [],
+        "candidates": candidates or {}, "margin": round(margin, 3),
+        "families_supporting": families or [],
         "basis": [why],
         "new_slot_profile": {k: cluster.get(k, "unknown") for k in ("gender", "age_band", "timbre")},
         "reason": why,
@@ -331,9 +460,11 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
     assignments: List[Dict[str, Any]] = []
     pending: List[Dict[str, Any]] = []
     new_slot_index = len(slots)
+    visual_votes_by_cluster: Dict[str, Dict[str, float]] = {}
 
     for cluster_id, cluster in sorted((ev["acoustic"] or {}).items()):
         result = match_cluster(cluster_id, cluster, slots, ev)
+        visual_votes_by_cluster[cluster_id] = dict(result.get("visual_votes") or {})
         if result["slot_id"] is None:
             new_slot_index += 1
             slot_id = f"S{new_slot_index}"
@@ -349,8 +480,13 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
             result["slot_id"] = slot_id
             pending.append({"slot_id": slot_id, "cluster_id": cluster_id,
                             "reason": result["reason"]})
+        visual_top = None
+        if visual_votes_by_cluster.get(cluster_id):
+            visual_top = max(visual_votes_by_cluster[cluster_id].items(),
+                             key=lambda kv: (-kv[1], kv[0]))[0]
         assignments.append({
             "cluster_id": cluster_id,
+            "visual_top_slot": visual_top,
             "assignment": {k: result[k] for k in
                            ("slot_id", "status", "matched_via", "candidates", "margin",
                             "families_supporting", "basis")},
@@ -362,6 +498,20 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
             "line_count": cluster.get("line_count", 0),
         })
 
+    # Reverse audit of the separation layer: one person spread over several
+    # clusters is the anomaly we CAN see (two clusters, same face seen talking).
+    # The opposite - one cluster carrying several people - is invisible from this
+    # evidence, so no field claims to detect it.
+    by_visual_top: Dict[str, List[str]] = {}
+    for assignment in assignments:
+        top = assignment.get("visual_top_slot")
+        if top:
+            by_visual_top.setdefault(top, []).append(assignment["cluster_id"])
+    over_split = [{"slot_id": slot, "clusters": sorted(clusters),
+                   "note": "两个人类簇的视觉正证据指向同一画像，怀疑声学过度切分"}
+                  for slot, clusters in sorted(by_visual_top.items()) if len(clusters) > 1]
+
+    abstained = [a for a in assignments if a["assignment"]["status"] == "unknown"]
     doc = {
         "schema": CAST_SCHEMA,
         "series": approved.get("series") or Path(ws).name,
@@ -377,6 +527,9 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
             "visual": {k: ev["visual"][k] for k in
                        ("clips_total", "clips_visual_usable", "clips_positive", "available")},
         },
+        "over_split_suspects": over_split,
+        "abstention": {"clusters": len(assignments), "abstained": len(abstained),
+                       "rate": round(len(abstained) / len(assignments), 3) if assignments else 0.0},
         "gates": {
             "auto_match_min_margin": AUTO_MATCH_MIN_MARGIN,
             "min_families_for_auto_match": MIN_FAMILIES_FOR_AUTO_MATCH,
@@ -473,6 +626,9 @@ def main() -> None:
                             if c["assignment"]["matched_via"] != "new_slot"),
         "new_slots": sum(1 for c in doc["clusters"]
                          if c["assignment"]["matched_via"] == "new_slot"),
+        "abstained": doc["abstention"]["abstained"],
+        "abstention_rate": doc["abstention"]["rate"],
+        "over_split_suspects": len(doc["over_split_suspects"]),
         "cast_table_present": doc["gates"]["cast_table_present"],
         "thresholds_are_measured": doc["gates"]["thresholds_are_measured"],
         "visual_family_available": doc["evidence_summary"]["visual"]["available"],
