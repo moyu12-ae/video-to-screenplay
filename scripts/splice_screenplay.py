@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import cast_signoff
 import series
 
 EXIT_NAMING_VIOLATION = 9  # a name-shaped speaker label traced to nothing while a
@@ -383,6 +384,10 @@ def main():
     # name that appears in the text.
     cast_doc = load_json(ws / ".cache" / "cast" / "cast.json")
     cast_summary = summarize_cast(cast_doc) if isinstance(cast_doc, dict) else None
+    # --draft semantics: shipping without sign-off is allowed, being quiet about
+    # it is not. The notice sits in the deliverable's own header table, because an
+    # appendix note is the first thing a reader skips.
+    cast_notice = cast_signoff.cmd_draft_banner(cast_doc, cast_enforced)
 
     title = args.title or ws.name
     safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
@@ -406,6 +411,9 @@ def main():
         f"| **台词来源** | {extracted.get('source_detail', '')}，{len(verbatim)} 条，由占位符逐字回填 |",
         f"| **分镜来源** | {shots_doc.get('total_scenes', '?')} 个镜头，{total_scenes} 个宏场景（LGSS-DP + 关键帧色板亲和度） |",
         "| **体例** | 中文场号制（H2 场头【标题】+ △ 视听动作段 + 同一说话人连续台词以／合并；台词一字未改） |",
+        ("| **演员表** | ⚠️ " + cast_notice + " |") if cast_notice else
+        "| **演员表** | 已签核"
+        + (f"（表版本 {cast_summary['cast_version']}）" if cast_summary else "") + " |",
         "| **生成** | Video-to-Screenplay Pipeline v2（证据包 → LLM 写作 → 占位符回填校验） |",
         "",
         "---",
