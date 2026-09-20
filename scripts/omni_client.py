@@ -73,8 +73,14 @@ DIARIZE_PROMPT = (
     "Transcribe ALL speech in this media and perform speaker diarization: assign each segment to a "
     'consistent speaker label (e.g. "Speaker 1", "Speaker 2") and give an accurate start and end '
     "time in seconds.{speakers}{lang} "
+    "For each segment also report how the voice SOUNDS, using exactly one allowed value per field: "
+    'gender in {{male|female|unknown}}, age_band in {{child|teen|young_adult|adult|elderly|unknown}}, '
+    'timbre in {{bright|sharp|deep|low|hoarse|soft|nasal|robotic|unknown}}. Judge these from the audio '
+    'only, never from what is being said, and answer "unknown" whenever you are not sure - an '
+    'unknown is useful, a guess is not. '
     "Output STRICTLY this JSON and nothing else: "
-    '{{"segments": [{{"speaker": "<label>", "start": <sec>, "end": <sec>, "text": "<text>"}}]}}'
+    '{{"segments": [{{"speaker": "<label>", "start": <sec>, "end": <sec>, "text": "<text>", '
+    '"gender": "<value>", "age_band": "<value>", "timbre": "<value>"}}]}}'
 )
 
 

@@ -36,6 +36,8 @@ THUMB_WIDTH = 640
 # Kept in sync with av_understand.AV_NOTES_SCHEMA by a test (importing that module
 # here would drag the network client into an offline stdlib-only stage).
 EXPECTED_AV_NOTES_SCHEMA = "vts-av-notes/v2"
+# Same arrangement with speaker_diarize.SPEAKERS_SCHEMA.
+EXPECTED_SPEAKERS_SCHEMA = "vts-speakers/v2"
 
 WRITING_CONTRACT = """\
 ## 写作合同（每场一个 scene_XX.md）
@@ -80,6 +82,9 @@ WRITING_CONTRACT = """\
    characters_manifest 的称呼为准。
 4. 角色名只能来自 bible.characters / characters_manifest / 本场 dialogues 里出现过的称呼；
    认不出的人用描述性指称（路人（男）/神秘人物），绝不发明专有名词。
+   描述性指称要取材清单里的 speaker_profiles（声学层实测的性别/年龄带/音线，
+   如「青年男声」「老年女声」），并在 support 显示只有 1 条观测时降为「男声」这类
+   更弱的说法——profile 里是 unknown 的字段**不许**补全成具体形象。
 5. 视听绝对性：**目击者原则**——只写画面可见、耳朵可闻的内容；禁止心理描写与回忆
    （不写"她想起五年前……心中涌起悔恨"，写"她动作僵住，死死攥住拳头，指甲几乎
    陷进肉里，下颌肌肉紧绷"——演员能演、摄影机能拍）。**Notnot 原则**——银幕呈现
@@ -215,8 +220,28 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
 
     speakers_doc = load_json(speakers_path)
     characters_manifest: Dict[str, Any] = {}
+    speaker_profiles: List[Dict[str, Any]] = []
     if isinstance(speakers_doc, dict):
         characters_manifest = speakers_doc.get("characters_manifest", {}) or {}
+        if speakers_doc.get("clusters") and speakers_doc.get("schema") != EXPECTED_SPEAKERS_SCHEMA:
+            sys.stderr.write(
+                f"[WARN] speakers.json schema is {speakers_doc.get('schema')!r}, this build expects "
+                f"{EXPECTED_SPEAKERS_SCHEMA!r} - acoustic attributes (gender/age_band/timbre) may be "
+                "missing, so the writer has less evidence for speaker labels; rerun speaker_diarize merge.\n")
+        for cl in speakers_doc.get("clusters") or []:
+            if not isinstance(cl, dict):
+                continue
+            acoustic = cl.get("acoustic") or {}
+            speaker_profiles.append({
+                "cluster_id": cl.get("cluster_id"),
+                "name": cl.get("name"),
+                "line_count": cl.get("line_count"),
+                "speech_ms": cl.get("speech_ms"),
+                "gender": acoustic.get("gender", "unknown"),
+                "age_band": acoustic.get("age_band", "unknown"),
+                "timbre": acoustic.get("timbre", "unknown"),
+                "support": {k: v for k, v in acoustic.items() if str(k).endswith("_support")},
+            })
 
     bible_doc = load_json(ws / "materials" / "bible.json") or {}
     bible_names: List[str] = []
@@ -307,6 +332,7 @@ def build_manifest(ws: Path, max_keyframes: int) -> Dict[str, Any]:
         "instructions": WRITING_CONTRACT,
         "bible_names": bible_names,
         "characters_manifest": characters_manifest,
+        "speaker_profiles": speaker_profiles,
         "exemplars": exemplars,
         "total_scenes": len(manifest_scenes),
         "scenes": manifest_scenes,

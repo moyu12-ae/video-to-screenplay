@@ -81,7 +81,7 @@ materials/cast.approved.json（系列级，只读）
     "gender": "female",
     "age_band": "teen",
     "visual_anchors": [{"desc": "黑发齐刘海，白色上衣", "first_seen_ms": 340000}],
-    "voice_profile": {"gender": "female", "age_band": "teen", "voice": "明亮偏尖"},
+    "voice_profile": {"gender": "female", "age_band": "teen", "timbre": "bright"},
     "evidence": [{"kind": "subtitle_address", "line": 7, "note": "被『茉里 你交朋友了』称呼"}],
     "approved_by": "human", "approved_at": "2026-09-19"
   }],
@@ -303,6 +303,12 @@ approved 表带 `version` 与历史（每次签核追加一条，不原地改）
 
 - **声学属性**（性别/年龄带/音线）：在**已付费的同一次分离调用**里多问几个字段，零额外调用。
   未知值一律 `unknown`，禁止兜底猜测。
+  **三者都是闭合枚举**（`gender: male|female|unknown`；`age_band: child|teen|young_adult|adult|
+  elderly|unknown`；`timbre: bright|sharp|deep|low|hoarse|soft|nasal|robotic|unknown`），
+  不是自由文本——早期草稿里写的"音线：明亮偏尖"那种描述跨 part 做多数票**永远不收敛**，
+  等于白问。簇级按 ≥60% 已知票取胜，`unknown` 票不进分母（缺数据不是反对票，同 §7 视觉族规则），
+  并随簇输出 `*_support`（如 `3/4 turns`）与顶层 `acoustic_attribute_compliance`
+  （模型到底有多少条真的答了）——**提示词是否生效要有数，不假设**。
 - **视觉说话（ASD）是"单边证据"：说了就算，沉默不算否证。**（本条结论来自 ep02 第二段的四次实测，
   见下方"实测记录"。）要问的不是"口型对不对得上这个音"（音素级同步，番剧确实失效），而是
   "这个人的嘴在连续画面里有没有反复开合"。实测性质：**高精度、低召回**——它点名某人动嘴时基本可信
@@ -440,7 +446,11 @@ A3 (6)            → 黑发×1、红发×1（平票）   静默负对照(2) →
    绑定后两集各自读到同一 2 条窗口与 2 个已签核实体，系列表读取后未被改动）：
    `workspace.py init --series`、快照 `.v2s-series`、
    `op_ed_windows` 搬家。**先做这个**——演员表要住在这里，没有它后面全部落不了地。
-1. **P0 声学属性**：diarize prompt + normalize + 簇聚合多数票。最小、零额外调用、可独立验证。
+1. **P0 声学属性** ✅ **已落地**（prompt 三个闭合枚举 + `_sanitize_attr` 越界即 `unknown` +
+   `aggregate_acoustic` 簇级多数票（`unknown` 不进分母、附 `*_support`）+
+   `acoustic_attribute_compliance` 计数 + `speakers.json` 升 `vts-speakers/v2`，
+   manifest 消费为 `speaker_profiles` 并对旧 schema 出 WARN。零额外调用；实测 15 条新测试）：
+   diarize prompt + normalize + 簇聚合多数票。最小、零额外调用、可独立验证。
 2. **P1 呼语抽取 + lint 方向反转**：纯本地字符串规则；先把"我这轮犯的错"和那个「…的声音」后缀偏置
    一起堵死（性价比最高，插队早做）。
 3. **P2 `resolve_cast.py` + `cast.json` schema + 生命周期**：含 **§4.1 三级匹配优先级**、

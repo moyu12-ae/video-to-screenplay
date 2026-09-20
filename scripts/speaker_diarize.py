@@ -92,6 +92,21 @@ NAME_VOTE_MIN_SHARE = 0.60   # metadata-name share required to name a cluster
 NAME_VOTE_MIN_COUNT = 2      # minimum metadata votes to name a cluster
 TEXT_AGREEMENT_RATIO = 0.60  # difflib ratio between subtitle text and Omni transcript
 
+# --- v0.6 P0: acoustic attributes (asked in the SAME paid diarization call) -----
+# Closed enums on purpose. Free-text timbre ("明亮偏尖" vs "清亮偏尖") would never
+# survive a majority vote across parts, so the enum is what makes the field
+# aggregatable - and it is why §3 of the design doc stores `timbre` as a code, not
+# a description. Anything the model returns outside the enum becomes "unknown";
+# guessing is worse than abstaining because these feed §4.1 auto-merge.
+ACOUSTIC_ATTRIBUTES = ("gender", "age_band", "timbre")
+ACOUSTIC_ENUMS: Dict[str, set] = {
+    "gender": {"male", "female", "unknown"},
+    "age_band": {"child", "teen", "young_adult", "adult", "elderly", "unknown"},
+    "timbre": {"bright", "sharp", "deep", "low", "hoarse", "soft", "nasal", "robotic", "unknown"},
+}
+ACOUSTIC_ATTR_MIN_SHARE = 0.60  # winning value must hold ≥60% of the known votes
+SPEAKERS_SCHEMA = "vts-speakers/v2"  # v1 (implicit) had no acoustic attributes
+
 _PUNCT_RE = re.compile(r"[\s，。：:；;！!？?、,.\[\]【】()（）「」『』…—·\-–]")
 
 
@@ -345,7 +360,10 @@ def make_workorder(video_path: str, duration_ms: Optional[int], parts: List[Tupl
             "overlap_ms": int(CHUNK_OVERLAP_SEC * 1000),
             "boundary_snap": "silence midpoint ±5s via ffmpeg silencedetect",
         },
-        "expected_segment_schema": {"speaker": "<label>", "start": 0.0, "end": 0.0, "text": "<text>"},
+        "expected_segment_schema": {"speaker": "<label>", "start": 0.0, "end": 0.0, "text": "<text>",
+                                    "gender": "<male|female|unknown>",
+                                    "age_band": "<child|teen|young_adult|adult|elderly|unknown>",
+                                    "timbre": "<bright|sharp|deep|low|hoarse|soft|nasal|robotic|unknown>"},
         "parts": part_entries,
         "note": (
             "Path A (recommended): `speaker_diarize.py --workspace <ws> run` dials DashScope "
@@ -574,6 +592,38 @@ def load_subtitle_items(path: str) -> List[Dict[str, Any]]:
     return [it for it in items if isinstance(it, dict)]
 
 
+def _sanitize_attr(value: Any, field: str) -> str:
+    """One acoustic attribute, coerced to the enum or 'unknown'. Case and stray
+    whitespace are tolerated; everything else is not a measurement."""
+    allowed = ACOUSTIC_ENUMS[field]
+    token = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return token if token in allowed else "unknown"
+
+
+def aggregate_acoustic(turns: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Majority vote over a cluster's speech turns, one field at a time.
+    'unknown' votes are excluded from the numerator AND the denominator - they
+    are missing data, not evidence against the winner (same rule the design doc
+    §7 sets for the visual family). A value wins only at ≥ACOUSTIC_ATTR_MIN_SHARE
+    of the known votes, so a genuinely mixed cluster reports 'unknown'."""
+    out: Dict[str, Any] = {}
+    for field in ACOUSTIC_ATTRIBUTES:
+        votes: Counter = Counter()
+        for t in turns:
+            value = str(t.get(field) or "unknown")
+            if value != "unknown":
+                votes[value] += 1
+        known = sum(votes.values())
+        winner, share = "unknown", 0.0
+        if votes:
+            top, count = votes.most_common(1)[0]
+            if count / known >= ACOUSTIC_ATTR_MIN_SHARE:
+                winner, share = top, count / known
+        out[field] = winner
+        out[f"{field}_support"] = f"{int(share * known) if winner != 'unknown' else 0}/{known} turns"
+    return out
+
+
 def normalize_omni_segments(data: Dict[str, Any], offset_ms: int) -> List[Dict[str, Any]]:
     """Extract speech turns from one saved Omni JSON block. Times arrive in
     SECONDS (verified against the tool source); converted to ms + part offset.
@@ -595,12 +645,15 @@ def normalize_omni_segments(data: Dict[str, Any], offset_ms: int) -> List[Dict[s
             continue
         if not speaker or end <= start or start < 0:
             continue
-        turns.append({
+        turn = {
             "raw_label": str(speaker),
             "start_ms": int(round(start * 1000)) + offset_ms,
             "end_ms": int(round(end * 1000)) + offset_ms,
             "text": str(seg.get("text") or ""),
-        })
+        }
+        for field in ACOUSTIC_ATTRIBUTES:
+            turn[field] = _sanitize_attr(seg.get(field), field)
+        turns.append(turn)
     turns.sort(key=lambda t: (t["start_ms"], t["end_ms"], t["raw_label"]))
     return turns
 
@@ -841,7 +894,9 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
         named_rows.append(row)
 
     cluster_parts: Dict[str, set] = {}
+    cluster_turns: Dict[str, List[Dict[str, Any]]] = {}
     for t in turns:
+        cluster_turns.setdefault(t["cluster_id"], []).append(t)
         cluster_parts.setdefault(t["cluster_id"], set()).add(t.get("part_file"))
     clusters = []
     for cluster_id in sorted(cluster_lines.keys(), key=lambda c: int(c.rsplit("A", 1)[1])):
@@ -852,12 +907,20 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
             "line_count": len(lines),
             "speech_ms": sum(int(l.get("end_ms", 0)) - int(l.get("start_ms", 0)) for l in lines),
             "parts": sorted(cluster_parts.get(cluster_id, set())),
+            "acoustic": aggregate_acoustic(cluster_turns.get(cluster_id, [])),
         })
+
+    # Prompt-compliance measurement (the same discipline as the design doc's P3
+    # gate): these fields only earn a weight once we know how often the model
+    # actually answers them, so record it instead of assuming the prompt worked.
+    attr_known = {f: sum(1 for t in turns if t.get(f, "unknown") != "unknown") for f in ACOUSTIC_ATTRIBUTES}
+    attr_total = len(turns)
 
     unattributed = sum(1 for r in named_rows if r["speaker"] is None)
     metas = [m for m in (part_metas or []) if isinstance(m, dict)]
     models = sorted({str(m["model"]) for m in metas if m.get("model")})
     return {
+        "schema": SPEAKERS_SCHEMA,
         "video_path": video_name,
         "total_segments": len(named_rows),
         # Distinct attributed identities, not line count and not the naming manifest:
@@ -881,6 +944,15 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
         },
         "subtitle_alignment": subtitle_alignment,
         "characters_manifest": manifest,
+        # How often the model actually answered the P0 fields. The vote is only as
+        # good as this number, so it ships with the artifact instead of living in
+        # a notebook nobody reads.
+        "acoustic_attribute_compliance": {
+            "turns": attr_total,
+            "known": attr_known,
+            "rate": {f: (round(attr_known[f] / attr_total, 3) if attr_total else 0.0)
+                     for f in ACOUSTIC_ATTRIBUTES},
+        },
         "clusters": clusters,
         "speech_turns": [
             {
@@ -889,6 +961,7 @@ def build_output(video_name: str, items: List[Dict[str, Any]], rows: List[Dict[s
                 "part": t.get("part_file"),
                 "start_ms": t["start_ms"], "end_ms": t["end_ms"],
                 "omni_transcript": t["text"],
+                **{f: t.get(f, "unknown") for f in ACOUSTIC_ATTRIBUTES},
             }
             for t in turns
         ],
