@@ -400,3 +400,42 @@
   `installed_plugins_v2.json` + `enabledPlugins`) is documented in the README as **unverified**; it
   edits live application config and needs its own end-to-end experiment before being presented as fact.
 - **Tests**: +6 — **211 green**, ruff `--select F` clean.
+
+## 16. v0.6.0 — Cast Glossary: Naming Becomes an Institution, Not a Suggestion
+
+- **Trigger**: on the ep02 35-second slice the acoustic layer honestly output five anonymous clusters,
+  and the writer — with no evidence — named A1 「茉里」 (truth: the blond young man), then used that
+  invented name to overrule the acoustic attribution. The splice lint HAD flagged the fabricated names
+  as warnings and was ignored. v0.6 stops asking the model to guess better and takes naming away from
+  the model: evidence producers only produce evidence, one resolver converges, a human signs off, and
+  the lint enforces with a non-zero exit.
+- **The pipeline**: `series.py` gives a season-level config directory (`workspace.py init --series`,
+  snapshot + sha256 so an episode stays reproducible); the diarization prompt asks acoustic attributes
+  (closed enums, `unknown` is a real answer, majority vote per cluster) inside the already-paid call;
+  `vocatives.py` extracts address terms with exactly two roles — naming candidates and negative
+  evidence — an attribution edge is structurally impossible; `av_understand.py` gains per-action
+  `mouth_state`/`mouth_motion` (≤3 s windows, compliance-gated; only `speaking` counts — the ep02
+  breakfast scene proved chewing dominates "moving"); `resolve_cast.py` folds clusters into slots under
+  a three-tier match (two positive families + clear margin, or a NEW pending slot — over-merging is
+  irreversible) and can never mint a name; `cast_signoff.py` runs the round-based sign-off (five reply
+  outcomes, nothing half-written) writing `<series>/cast.approved.json` with version history;
+  `splice_screenplay.py` enforces lineage — a name-shaped speaker label must trace to THIS cluster's
+  signed entity, and the per-line audit (§6 rows 5-6) catches quiet re-attribution, waivable only by an
+  in-scene `<!-- attribution-override: ... -->` comment. Violations exit 9 before the deliverable is
+  written.
+- **Review-caught regressions, fixed on the branch**: the fatal exit implemented in P1 was deleted by
+  the 5319ab4 appendix refactor while every doc still promised exit 9 — 317 function-level tests stayed
+  green because they pinned the lint's return string, not the process; the regression test now drives
+  the CLI (exit code + no output file). The sign-off record initially carried no workspace scope, so
+  another episode's same-named cluster could inherit a naming with zero evidence; records now carry
+  `workspace` and unscoped ones fail closed.
+- **Measured, not assumed**: three real runs recorded in `references/cast_glossary_v0.6.md` (window
+  compliance 0.778→0.95 after rewording; `mouth_motion` split speaking from chewing; a 0.5 s macro
+  scene that permanently deadlocked the AV pass now degrades to a coverage gap). `gates.
+  thresholds_are_measured: false` travels with every artifact: the visual family's precision/recall
+  (≥20 hand-labelled windows, k≥3) was **consciously waived by the user at merge time** and remains
+  known debt; the abstention stop-loss (>50%) measured 0.6 on the second-episode run and is likewise
+  unresolved. Equal family weights and the 0.34 margin are starting points, flagged unmeasured in every
+  deliverable.
+- **Tests**: +129 → **340 green**; new suites pin every fatal row of the §6 checklist, the merge math
+  (unobserved flattens, never votes against), the sign-off conversation, and the series binding.

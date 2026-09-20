@@ -1,7 +1,7 @@
 {
   "name": "video-to-screenplay",
   "displayName": "Video to Screenplay",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Reverse-engineer videos and anime episodes into production-standard Chinese 场号制 screenplays: clean workspace isolation, a three-tier subtitle gate, FFmpeg shot cuts plus keyframes, LGSS-style DP scene clustering with an optional McKee sequence layer, optional Qwen3.8-Omni audio-visual understanding, and verbatim [[SUB:n]] splicing that makes dialogue fidelity structural. Requires an Aliyun DashScope API key (DASHSCOPE_API_KEY) for the two Qwen3.8-Omni passes, which upload audio segments and short video clips - see SECURITY.md.",
   "descriptionZh": "把长视频与番剧逆向还原为制作级中文场号制剧本：三层纯净工作区、字幕三档门禁、FFmpeg 切镜与关键帧、LGSS 式 DP 语义场景分组（可选 McKee 序列层）、可选的 Qwen3.8-Omni 声画理解，以及用 [[SUB:n]] 占位符逐字拼装、从结构上保证台词保真。两处 Qwen3.8-Omni 能力需要阿里云 DashScope API Key（DASHSCOPE_API_KEY），会上传音频分片与短视频段——详见 SECURITY.md。",
   "author": {
