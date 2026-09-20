@@ -292,6 +292,140 @@ def lint_speaker_names(spliced_texts: List[str], allowed: set,
     return [f"未登记的说话人名称（请核对是否杜撰）: {listed}"]
 
 
+OVERRIDE_COMMENT_RE = re.compile(r"<!--\s*attribution-override:\s*(.*?)-->", re.S)
+# A line number must not be preceded by a letter, so the 2 inside 「C2」 can never
+# waive a violation against line 2; cluster tokens are letter-prefixed by contrast.
+_STANDALONE_NUM_RE = re.compile(r"(?<![A-Za-z])\d+")
+_CLUSTER_TOKEN_RE = re.compile(r"[A-Za-z_]+\d+")
+
+
+def _norm_cluster_token(token: str) -> str:
+    return token.strip().upper().replace("SPEAKER_", "")
+
+
+def parse_overrides(text: str) -> List[Dict[str, Any]]:
+    """Well-formed `<!-- attribution-override: ... -->` comments in one scene draft.
+
+    A comment covers line n when n appears as a standalone number (「8,9」 yes, the
+    2 inside 「C2」 no) and covers a cluster when its id appears as a letter token
+    (「A1」 matches SPEAKER_A1). A comment that parses to neither covers nothing,
+    so a sloppy note can never silently waive a violation.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in OVERRIDE_COMMENT_RE.finditer(text):
+        body = m.group(1)
+        out.append({
+            "lines": {int(x) for x in _STANDALONE_NUM_RE.findall(body)},
+            "clusters": {_norm_cluster_token(t) for t in _CLUSTER_TOKEN_RE.findall(body)},
+            "text": body.strip(),
+        })
+    return out
+
+
+def _covers(override: Dict[str, Any], sub_index: int, cluster_id: str) -> bool:
+    return sub_index in override["lines"] \
+        or _norm_cluster_token(cluster_id) in override["clusters"]
+
+
+def _sub_index_heads(text: str) -> Dict[int, str]:
+    """Map each [[SUB:n]] to the dialogue head it sits under.
+
+    A placeholder belongs to the nearest preceding head - the writing contract
+    puts dialogue on the head's own line, so anything before the first head has
+    no speaker to contradict and is skipped.
+    """
+    events: List[Tuple[int, str, Any]] = []
+    slug = SLUG_LINE_RE.search(text)
+    for m in DIALOGUE_HEAD_RE.finditer(text):
+        if slug and m.start() == slug.start():
+            continue
+        events.append((m.start(), "head", m.group(1).strip()))
+    for m in PLACEHOLDER_RE.finditer(text):
+        events.append((m.start(), "sub", int(m.group(1))))
+    events.sort(key=lambda e: e[0])
+    out: Dict[int, str] = {}
+    head: Optional[str] = None
+    for _, kind, val in events:
+        if kind == "head":
+            head = val
+        elif head is not None:
+            out[int(val)] = head
+    return out
+
+
+def audit_attribution(draft_texts: List[str], dialogues_by_scene: List[List[Dict[str, Any]]],
+                      cast_doc: Dict[str, Any]) -> Tuple[List[str], int]:
+    """§6 rows 5-6: the draft must not quietly overrule the resolver.
+
+    The lineage gate can only say a label traces to SOME signed entity; it cannot
+    see that lines 8-9 sit under a head naming an entity OTHER than the one the
+    line's own cluster was signed to - the ep02 accident, wearing a table. For
+    each dialogue line, the head's name-shaped parts must name the line's own
+    cluster entity. Two violations:
+
+      - the cluster has an entity and the head names a different one (改判, row 5)
+      - the cluster has no entity and the head names anyone at all (row 6)
+
+    Both are waivable only by an in-scene attribution-override comment covering
+    that line or its cluster: overtaking the machine is allowed, doing it
+    invisibly is not. Descriptive parts re-attribute nothing. Returns
+    (fatal violation strings, override comment count for the fidelity report).
+    """
+    entities = {str(e.get("id")): e for e in (cast_doc.get("entities") or []) if isinstance(e, dict)}
+    cluster_entity: Dict[str, str] = {}
+    surface_entity: Dict[str, str] = {}
+    known_clusters: set = set()
+    for c in cast_doc.get("clusters") or []:
+        if isinstance(c, dict) and c.get("cluster_id"):
+            known_clusters.add(str(c["cluster_id"]))
+        assignment = c.get("assignment") if isinstance(c, dict) else None
+        entity = entities.get(str((assignment or {}).get("entity_id") or "")) or {}
+        name = str(entity.get("canonical_name") or (assignment or {}).get("entity_name") or "").strip()
+        if isinstance(c, dict) and str((assignment or {}).get("status")) == "approved" and name:
+            cluster_entity[str(c["cluster_id"])] = name
+            for surface in [name] + [str(a).strip() for a in (entity.get("aliases") or [])]:
+                if surface:
+                    surface_entity[surface] = name
+    overrides = [o for text in draft_texts for o in parse_overrides(text)]
+    violations: List[str] = []
+    for text, dialogues in zip(draft_texts, dialogues_by_scene):
+        sub_heads = _sub_index_heads(text)
+        for d in dialogues or []:
+            if not isinstance(d, dict):
+                continue
+            speaker = str(d.get("speaker") or "").strip()
+            raw = d.get("sub_index")
+            if not speaker or speaker == "SPEAKER_UNKNOWN" or raw is None:
+                continue
+            if speaker not in known_clusters:
+                continue  # a stale cast.json must not invent violations
+            sub_index = int(raw)
+            head = sub_heads.get(sub_index)
+            if not head:
+                continue
+            parts = [p for p in labels.split_head(head) if labels.looks_like_name(p)]
+            if not parts:
+                continue
+            expected = cluster_entity.get(speaker)
+            traced = {}
+            for part in parts:
+                surface = labels.trace(part, surface_entity.keys())
+                if surface:
+                    traced[part] = surface_entity[surface]
+            if not traced:
+                continue  # nothing traces: that is the lineage gate's job, not re-attribution
+            if expected is not None and expected in set(traced.values()):
+                continue  # the head names this line's own entity (any of its surfaces)
+            if any(_covers(o, sub_index, speaker) for o in overrides):
+                continue
+            expected_desc = f"演员表记为「{expected}」" if expected else "演员表中无定名"
+            violations.append(
+                f"第 {sub_index} 条台词说话人被写成 {'、'.join(sorted(traced))}，"
+                f"但该簇{expected_desc}（簇 {speaker}）——如确要改判，须在本场景草稿内留痕："
+                "<!-- attribution-override: ... -->")
+    return sorted(dict.fromkeys(violations)), len(overrides)
+
+
 def summarize_cast(cast_doc: Dict[str, Any]) -> Dict[str, Any]:
     """named / candidate / unknown per cluster, plus the resolver's own caveats."""
     statuses = [str((c.get("assignment") or {}).get("status") or "unknown")
@@ -311,7 +445,8 @@ def summarize_cast(cast_doc: Dict[str, Any]) -> Dict[str, Any]:
 
 def fidelity_lines(appendix_rows: str, dialogue_total: int, spliced_count: int,
                    cast_summary: Optional[Dict[str, Any]],
-                   label_buckets: Dict[str, List[str]], cast_enforced: bool) -> List[str]:
+                   label_buckets: Dict[str, List[str]], cast_enforced: bool,
+                   override_count: int = 0) -> List[str]:
     """The fidelity appendix, one paragraph per list item.
 
     Every line here must survive regardless of whether a cast.json exists: the
@@ -346,6 +481,7 @@ def fidelity_lines(appendix_rows: str, dialogue_total: int, spliced_count: int,
         "表外专名 {untraced} 个".format(named=len(label_buckets["named"]),
                                         descriptive=len(label_buckets["descriptive"]),
                                         untraced=len(label_buckets["untraced"]))
+        + (f"；留痕改判 {override_count} 处（attribution-override）" if override_count else "")
         + ("；演员表已生效，表外专名为致命" if cast_enforced
            else "；本工作区未绑定已签核演员表，故仅告警（成稿按未核验处理）") + "\n")
     return lines
@@ -470,6 +606,26 @@ def main():
     # appendix note is the first thing a reader skips.
     cast_notice = cast_signoff.cmd_draft_banner(cast_doc, cast_enforced)
 
+    # With a signed table in force, naming violations are not warnings: the lint
+    # of the ep02 era was pointed at and ignored precisely because nothing stopped
+    # the run. This exits non-zero BEFORE the deliverable is written - and the
+    # regression test drives the CLI, not the lint function, because 5319ab4
+    # showed a function-level test cannot pin a process behaviour.
+    fatal_naming = list(naming_warnings) if cast_enforced else []
+    override_count = 0
+    if cast_enforced and isinstance(cast_doc, dict):
+        drafts = [p.read_text(encoding="utf-8") for p in scene_files]
+        scene_dialogues = [sc.get("dialogues") or [] for sc in manifest["scenes"]]
+        attribution_violations, override_count = audit_attribution(drafts, scene_dialogues, cast_doc)
+        fatal_naming += attribution_violations
+    if fatal_naming:
+        for line in fatal_naming:
+            sys.stderr.write(f"[FATAL] {line}\n")
+        sys.stderr.write("[ACTION] 回到阶段 3.8 签核，或在场景草稿内留痕改判"
+                         "（<!-- attribution-override: ... -->），或解除系列绑定走 --draft 语义。\n")
+        sys.exit(EXIT_NAMING_VIOLATION)
+
+
     title = args.title or ws.name
     safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
     out_dir = (ws / "output").resolve()
@@ -515,7 +671,8 @@ def main():
     # parses as `(A + B) if cond else (C + D)`, which silently deleted the label
     # composition line whenever a cast.json existed.
     appendix = "".join(fidelity_lines(appendix_rows, len(verbatim), spliced_count,
-                                      cast_summary, label_buckets, cast_enforced))
+                                      cast_summary, label_buckets, cast_enforced,
+                                      override_count))
 
     body = "\n---\n\n".join(part.strip() + "\n" for part in spliced_texts)
     document = "\n".join(header) + "\n" + body + appendix

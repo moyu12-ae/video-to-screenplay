@@ -12,6 +12,7 @@ the assembly tables.
 import io
 import json
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,8 @@ from pathlib import Path
 SCRIPTS_DIR = (Path(__file__).parent.parent / "scripts").resolve()
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-import splice_screenplay as sp
+import series  # noqa: E402
+import splice_screenplay as sp  # noqa: E402
 
 
 def write_scene(drafts_dir: Path, idx: int, text: str) -> Path:
@@ -275,6 +277,176 @@ class TestSpeakerLineageGate(unittest.TestCase):
 
     def test_no_cast_document_means_no_lineage_requirement(self):
         self.assertIsNone(sp.cast_lineage_names(None))
+
+
+class TestAttributionAudit(unittest.TestCase):
+    """§6 rows 5-6: a draft must not quietly overrule cast.json. The lineage gate
+    says a label traces to SOME signed entity; only the per-line audit can see
+    that line 1's cluster was signed as someone else - the ep02 accident wearing
+    a table. Every violation is waivable by an in-scene attribution-override
+    comment, and nothing else waives it."""
+
+    CAST = {
+        "entities": [
+            {"id": "C1", "canonical_name": "托德", "status": "approved", "aliases": []},
+            {"id": "C2", "canonical_name": "玛丽亚", "status": "approved", "aliases": []},
+        ],
+        "clusters": [
+            {"cluster_id": "SPEAKER_A1",
+             "assignment": {"slot_id": "S1", "status": "approved", "entity_id": "C1"}},
+            {"cluster_id": "SPEAKER_A2",
+             "assignment": {"slot_id": "S2", "status": "approved", "entity_id": "C2"}},
+            {"cluster_id": "SPEAKER_A3",
+             "assignment": {"slot_id": "S3", "status": "unknown", "entity_id": None}},
+        ],
+    }
+    DIALOGUES = [
+        [{"sub_index": 1, "speaker": "SPEAKER_A1"},
+         {"sub_index": 2, "speaker": "SPEAKER_A3"}],
+        [],
+    ]
+
+    def _audit(self, texts, dialogues=None):
+        return sp.audit_attribution(texts, self.DIALOGUES if dialogues is None else dialogues,
+                                    self.CAST)
+
+    def test_placeholder_maps_to_the_nearest_preceding_head(self):
+        text = "**内景·日**｜x\n\n**托德**：[[SUB:1]]\n\n**奶奶**\n（放下碗）\n[[SUB:2]]\n"
+        heads = sp._sub_index_heads(text)
+        self.assertEqual(heads, {1: "托德", 2: "奶奶"})
+
+    def test_placeholder_before_any_head_has_no_speaker(self):
+        text = "**内景·日**｜x\n（字幕卡：[[SUB:4]]）\n**托德**：[[SUB:1]]\n"
+        self.assertEqual(sp._sub_index_heads(text), {1: "托德"})
+
+    def test_override_numbers_ignore_digits_inside_entity_ids(self):
+        covers = sp.parse_overrides("<!-- attribution-override: A1 8,9 → C2 reason=呼语 -->")
+        self.assertEqual(covers[0]["lines"], {8, 9}, "the 2 in C2 is not line 2")
+        self.assertTrue(sp._covers(covers[0], 8, "SPEAKER_A1"))
+        self.assertFalse(sp._covers(covers[0], 2, "SPEAKER_A2"))
+
+    def test_re_attribution_to_another_signed_entity_is_a_violation(self):
+        violations, count = self._audit(["**内景·日**｜x\n\n**玛丽亚**：[[SUB:1]]\n"])
+        self.assertEqual(count, 0)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("第 1 条", violations[0])
+        self.assertIn("玛丽亚", violations[0])
+        self.assertIn("托德", violations[0])
+
+    def test_the_line_s_own_entity_passes(self):
+        self.assertEqual(self._audit(["**内景·日**｜x\n\n**托德**：[[SUB:1]]\n"])[0], [])
+
+    def test_an_override_comment_waives_the_re_attribution(self):
+        text = ("**内景·日**｜x\n\n<!-- attribution-override: A1 1 → C2 reason=呼语 -->\n\n"
+                "**奶奶**：[[SUB:1]]\n")
+        violations, count = self._audit([text])
+        self.assertEqual(violations, [])
+        self.assertEqual(count, 1)
+
+    def test_an_override_for_another_line_and_cluster_waives_nothing(self):
+        text = "**内景·日**｜x\n\n<!-- attribution-override: A2 9 → C1 -->\n\n**玛丽亚**：[[SUB:1]]\n"
+        self.assertEqual(len(self._audit([text])[0]), 1)
+
+    def test_a_proper_name_on_an_unknown_cluster_is_a_violation(self):
+        violations, _ = self._audit(["**内景·日**｜x\n\n**托德**：[[SUB:2]]\n"])
+        self.assertEqual(len(violations), 1)
+        self.assertIn("无定名", violations[0])
+
+    def test_a_descriptive_head_reattributes_nothing(self):
+        self.assertEqual(self._audit(["**内景·日**｜x\n\n**青年男声**：[[SUB:2]]\n"
+                                      "**威严的声音**：[[SUB:1]]\n"])[0], [])
+
+    def test_a_stale_cluster_id_is_skipped_not_fatal(self):
+        dialogues = [[{"sub_index": 1, "speaker": "SPEAKER_Z9"}]]
+        self.assertEqual(self._audit(["**内景·日**｜x\n\n**玛丽亚**：[[SUB:1]]\n"], dialogues)[0], [])
+
+    def test_speaker_unknown_is_skipped(self):
+        dialogues = [[{"sub_index": 1, "speaker": "SPEAKER_UNKNOWN"}]]
+        self.assertEqual(self._audit(["**内景·日**｜x\n\n**玛丽亚**：[[SUB:1]]\n"], dialogues)[0], [])
+
+
+class TestNamingGateExitCode(unittest.TestCase):
+    """§13 scenario 3 drives the CLI, not the lint function: 5319ab4 accidentally
+    removed the fatal exit while refactoring the appendix, and 317 function-level
+    tests stayed green while the deliverable shipped with fabricated names and
+    exit 0. These tests pin the process behaviour: with a signed table in force,
+    a naming violation exits 9 and writes no deliverable."""
+
+    def _ws(self, root: Path, first_head: str, first_line_extra: str = "") -> Path:
+        ws = root / "episodes" / "ep02"
+        (ws / ".cache" / "alignment").mkdir(parents=True)
+        (ws / ".cache" / "subtitles").mkdir(parents=True)
+        (ws / ".cache" / "cast").mkdir(parents=True)
+        (ws / ".cache" / "scene_drafts").mkdir(parents=True)
+        (ws / "materials").mkdir(parents=True)
+        series_root = root / "series"
+        series_root.mkdir(exist_ok=True)
+        (series_root / "cast.approved.json").write_text(json.dumps({
+            "schema": "vts-cast/v1", "version": "1", "entities": [
+                {"id": "C1", "canonical_name": "托德", "status": "approved", "aliases": [],
+                 "approved_by": "human", "approved_at": "2026-09-20", "evidence": []},
+                {"id": "C2", "canonical_name": "玛丽亚", "status": "approved", "aliases": [],
+                 "approved_by": "human", "approved_at": "2026-09-20", "evidence": []},
+            ]}, ensure_ascii=False), encoding="utf-8")
+        series.bind_series(ws, series_root)
+        manifest = {"total_scenes": 1, "scenes": [{
+            "sequence_title": "", "start_timecode": "00:00:00:00",
+            "end_timecode": "00:00:10:00",
+            "dialogues": [{"sub_index": 1, "speaker": "SPEAKER_A1"},
+                          {"sub_index": 2, "speaker": "SPEAKER_A3"}]}]}
+        (ws / ".cache" / "alignment" / "scene_manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        (ws / ".cache" / "subtitles" / "extracted.json").write_text(json.dumps(
+            {"source_detail": "test", "items": [{"index": 1, "text": "你好"},
+                                                {"index": 2, "text": "下雨了"}]},
+            ensure_ascii=False), encoding="utf-8")
+        cast = {
+            "schema": "vts-cast/v1", "entities": TestAttributionAudit.CAST["entities"],
+            "clusters": TestAttributionAudit.CAST["clusters"], "slots": [],
+        }
+        (ws / ".cache" / "cast" / "cast.json").write_text(
+            json.dumps(cast, ensure_ascii=False), encoding="utf-8")
+        draft = (f"## 场 1【早饭桌】\n**内景·日**｜早饭桌\n\n"
+                 f"{first_line_extra}**{first_head}**：[[SUB:1]]\n\n"
+                 f"**青年男声**：[[SUB:2]]\n")
+        (ws / ".cache" / "scene_drafts" / "scene_01.md").write_text(draft, encoding="utf-8")
+        return ws
+
+    def _run(self, ws: Path):
+        return subprocess.run([sys.executable, str(SCRIPTS_DIR / "splice_screenplay.py"),
+                               "-w", str(ws)], capture_output=True, text=True)
+
+    def test_signed_names_exit_zero_and_write_the_deliverable(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), "托德")
+            res = self._run(ws)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue((ws / "output" / "ep02_影视文学剧本.md").is_file())
+
+    def test_untraced_proper_noun_exits_nine_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), "艾拉")
+            res = self._run(ws)
+            self.assertEqual(res.returncode, 9, res.stderr)
+            self.assertIn("艾拉", res.stderr)
+            self.assertFalse((ws / "output").exists(),
+                             "a violating run must not deliver a screenplay")
+
+    def test_re_attribution_to_a_signed_but_wrong_entity_exits_nine(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), "玛丽亚")
+            res = self._run(ws)
+            self.assertEqual(res.returncode, 9, res.stderr)
+            self.assertIn("attribution-override", res.stderr)
+
+    def test_an_override_comment_turns_the_re_attribution_legal(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(Path(td), "奶奶",
+                          "<!-- attribution-override: A1 1 → C2 reason=呼语 -->\n")
+            res = self._run(ws)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            delivered = (ws / "output" / "ep02_影视文学剧本.md").read_text(encoding="utf-8")
+            self.assertIn("留痕改判 1 处", delivered)
 
 
 class TestFidelityAppendix(unittest.TestCase):
