@@ -62,15 +62,20 @@ class TestConfirmationPath(unittest.TestCase):
                                                      encoding="utf-8")
             slots = [{"slot_id": "S3", "cluster_id": "SPEAKER_A1", "candidates": [],
                       "profile": {"gender": "male"}}]
-            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"})
+            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"},
+                           workspace="ep02")
             doc = json.loads((root / "cast.approved.json").read_text(encoding="utf-8"))
             records = [e for e in doc["entities"][0]["evidence"]
                        if isinstance(e, dict) and e.get("kind") == "signoff"]
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["cluster_id"], "SPEAKER_A1")
             self.assertEqual(records[0]["slot_id"], "S3")
+            self.assertEqual(records[0]["workspace"], "ep02",
+                             "the scope stops another episode's same-named cluster "
+                             "from inheriting this naming")
             # idempotent: answering the same round twice must not duplicate lineage
-            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"})
+            so.apply_round(root, {"series": "x"}, slots, {"S3": "accept", "S3:name": "托德"},
+                           workspace="ep02")
             doc = json.loads((root / "cast.approved.json").read_text(encoding="utf-8"))
             self.assertEqual(len([e for e in doc["entities"][0]["evidence"]
                                   if isinstance(e, dict) and e.get("kind") == "signoff"]), 1)

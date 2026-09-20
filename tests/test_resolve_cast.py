@@ -176,18 +176,34 @@ class TestAddressNegativeEvidence(unittest.TestCase):
         doc = resolve_cast.resolve(Path("/tmp"), ev)
         self.assertEqual(doc["clusters"][0]["not_speaker"], ["茉里"])
 
+    def test_an_address_term_under_an_alias_rules_the_slot_out_too(self):
+        """The vocative scan runs against canonical names AND aliases, so an
+        exclusion recorded as マリー must remove the 茉里 slot, not just fail to
+        match it: the cluster that spoke the line cannot be her either way."""
+        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN})
+        ev["address"]["not_speaker"] = {"SPEAKER_A1": ["マリー"]}
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        assignment = doc["clusters"][0]["assignment"]
+        self.assertEqual(assignment["matched_via"], "new_slot",
+                         "her only slot is ruled out, so the cluster gets its own")
+        self.assertIn("ruled out by 呼语", " ".join(assignment["basis"]))
+
 
 class TestSignOffClosesTheLoop(unittest.TestCase):
-    """cast_signoff records {kind: signoff, cluster_id} with approved_by: human.
-    Honouring that record is the only legal route by which a slot created in this
-    episode can carry a name - without it the sign-off would evaporate on the
-    next resolve, and the writer would be back to guessing."""
+    """cast_signoff records {kind: signoff, cluster_id, workspace} with
+    approved_by: human. Honouring that record is the only legal route by which a
+    slot created in this episode can carry a name - without it the sign-off would
+    evaporate on the next resolve, and the writer would be back to guessing.
+    The workspace scope matters as much as the record: a cluster id like
+    SPEAKER_A1 is a per-episode label, so an unscoped record would let another
+    episode's SPEAKER_A1 inherit the name with no evidence at all."""
 
     SIGNED = {"entities": [{
         "id": "C7", "canonical_name": "托德", "status": "approved", "aliases": [],
         "voice_profile": {}, "visual_anchors": [], "approved_by": "human",
         "approved_at": "2026-09-20",
-        "evidence": [{"kind": "signoff", "cluster_id": "SPEAKER_A1", "slot_id": "S3"}]}]}
+        "evidence": [{"kind": "signoff", "cluster_id": "SPEAKER_A1", "slot_id": "S3",
+                      "workspace": "tmp"}]}]}
 
     def test_a_signed_cluster_becomes_named_and_stops_being_pending(self):
         ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN,
@@ -200,6 +216,29 @@ class TestSignOffClosesTheLoop(unittest.TestCase):
         self.assertEqual(by_cluster["SPEAKER_A2"]["status"], "unknown")
         self.assertEqual([p["cluster_id"] for p in doc["pending"]], ["SPEAKER_A2"],
                          "the unsigned cluster stays a question")
+
+    def test_another_episodes_cluster_does_not_inherit_the_signoff(self):
+        """ep03's SPEAKER_A1 is a different voice that happens to reuse the label;
+        it must fall to a pending question, not silently become 托德."""
+        other = json.loads(json.dumps(self.SIGNED))
+        other["entities"][0]["evidence"][0]["workspace"] = "ep02"
+        ev = _evidence({"SPEAKER_A1": CLUSTER_UNKNOWN}, approved=other)
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        assignment = doc["clusters"][0]["assignment"]
+        self.assertEqual(assignment["matched_via"], "new_slot")
+        self.assertIsNone(assignment["entity_id"])
+        self.assertEqual([p["cluster_id"] for p in doc["pending"]], ["SPEAKER_A1"])
+
+    def test_a_record_without_a_workspace_scope_is_ignored(self):
+        """Fail closed: legacy/unscoped records name nobody."""
+        legacy = {"entities": [{
+            "id": "C7", "canonical_name": "托德", "status": "approved", "aliases": [],
+            "approved_by": "human", "approved_at": "2026-09-20",
+            "evidence": [{"kind": "signoff", "cluster_id": "SPEAKER_A1", "slot_id": "S3"}]}]}
+        ev = _evidence({"SPEAKER_A1": CLUSTER_UNKNOWN}, approved=legacy)
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        self.assertEqual(doc["clusters"][0]["assignment"]["matched_via"], "new_slot")
+        self.assertEqual([p["cluster_id"] for p in doc["pending"]], ["SPEAKER_A1"])
 
     def test_a_name_with_no_signoff_record_is_still_rejected(self):
         doc = resolve_cast.resolve(Path("/tmp"), _evidence({"SPEAKER_A1": CLUSTER_UNKNOWN}))

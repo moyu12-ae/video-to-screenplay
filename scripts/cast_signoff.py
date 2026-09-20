@@ -294,8 +294,15 @@ def load_history(series_root: Path) -> List[Dict[str, Any]]:
 
 
 def apply_round(series_root: Path, cast_doc: Dict[str, Any], slots: List[Dict[str, Any]],
-                decisions: Dict[str, str]) -> Dict[str, Any]:
-    """Write the accepted names, append a history entry, return the diff."""
+                decisions: Dict[str, str], workspace: str = "") -> Dict[str, Any]:
+    """Write the accepted names, append a history entry, return the diff.
+
+    `workspace` (the episode dir name) rides on every sign-off record: a cluster
+    id like SPEAKER_A1 is a per-episode label, so a record without that scope
+    would let episode 3's SPEAKER_A1 silently inherit episode 2's naming and
+    bypass the §4.1 evidence gate - exactly the merge this design exists to
+    prevent. resolve_cast.py honours records whose workspace matches its own.
+    """
     # Read the series file directly: load_approved resolves through a WORKSPACE
     # pointer, and a sign-off writes to the series root itself.
     table = series.read_json(series_root / series.CAST_FILENAME) or {}
@@ -331,7 +338,7 @@ def apply_round(series_root: Path, cast_doc: Dict[str, Any], slots: List[Dict[st
         # entity that merely EXISTS in the table says nothing about which speaker
         # it is, and that distinction is the whole ep02 accident.
         record = {"kind": "signoff", "slot_id": slot_id, "cluster_id": slot.get("cluster_id"),
-                  "date": date.today().isoformat()}
+                  "workspace": str(workspace or ""), "date": date.today().isoformat()}
         evidence = existing.setdefault("evidence", [])
         if isinstance(evidence, list) and not any(
                 isinstance(e, dict) and e.get("kind") == "signoff"
@@ -414,7 +421,7 @@ def main() -> None:
             if outcome["needs_confirmation"] or outcome["unparsed"]:
                 sys.stderr.write("[INFO] 有未确认或未解析的条目，本轮未写盘（演员表要么完整接受，要么不动）。\n")
                 sys.exit(EXIT_OK)
-            result = apply_round(root, cast_doc, window, outcome["decisions"])
+            result = apply_round(root, cast_doc, window, outcome["decisions"], workspace=ws.name)
             sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
             sys.stderr.write("[INFO] 已写入，请核对上面 diff；不对就运行 "
                              "workspace.py 的历史版本恢复（cast.approved.json 带 history）。\n")

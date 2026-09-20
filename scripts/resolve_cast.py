@@ -73,9 +73,7 @@ def _load(ws: Path, rel: str) -> Any:
 def _write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-        f.write("\n")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -405,9 +403,8 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
     """
     not_speaker = ev["address"].get("not_speaker") or {}
     ruled_out = set(not_speaker.get(cluster_id) or [])
-    entity_of = {s["slot_id"]: _entity_name(ev["approved"], s.get("entity_id")) for s in slots}
-    eligible = [s for s in slots if not (entity_of.get(s["slot_id"]) and
-                                         entity_of[s["slot_id"]] in ruled_out)]
+    surfaces_of = {s["slot_id"]: _entity_surfaces(ev["approved"], s.get("entity_id")) for s in slots}
+    eligible = [s for s in slots if not (set(surfaces_of.get(s["slot_id"]) or []) & ruled_out)]
     visual = ev["visual"]
     ac_counts, ac_unobserved = acoustic_distribution(cluster, eligible)
     per_cluster = visual.get("by_cluster")
@@ -479,10 +476,18 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
     }
 
 
-def _exact_attribute_bonus(cluster: Dict[str, Any], slot: Dict[str, Any]) -> float:
-    profile = slot.get("profile") or {}
-    return sum(1 for f in ("gender", "age_band", "timbre")
-               if _compatible(str(cluster.get(f) or "unknown"), str(profile.get(f) or "unknown")) is True) * 0.1
+def _entity_surfaces(approved: Dict[str, Any], entity_id: Optional[str]) -> List[str]:
+    """Canonical name plus aliases: an address term recorded under ANY surface of
+    an entity rules that slot out, not only the canonical spelling - the vocative
+    scan runs against the same surface list, so the two must agree."""
+    if not entity_id:
+        return []
+    for entity in approved.get("entities") or []:
+        if isinstance(entity, dict) and entity.get("id") == entity_id:
+            surfaces = [str(entity.get("canonical_name") or "").strip()]
+            surfaces += [str(a).strip() for a in (entity.get("aliases") or [])]
+            return [s for s in surfaces if s]
+    return []
 
 
 def _entity_name(approved: Dict[str, Any], entity_id: Optional[str]) -> Optional[str]:
@@ -520,14 +525,21 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
     approved = ev["approved"]
     """Fold every cluster into a slot under §4.1 and emit the cast document."""
     # A sign-off record is how a name gets back into the loop: cast_signoff writes
-    # {kind: "signoff", cluster_id, slot_id} with approved_by: "human", and honoring
-    # it is the ONLY way a slot created in this episode can carry an entity.
+    # {kind: "signoff", cluster_id, slot_id, workspace} with approved_by: "human",
+    # and honoring it is the ONLY way a slot created in this episode can carry an
+    # entity. Records are scoped to the workspace that signed them: a cluster id
+    # like SPEAKER_A1 is a per-episode label, so an unscoped record would let a
+    # different episode's SPEAKER_A1 inherit the name without any evidence - the
+    # merge §4.1 exists to prevent. Unknown scope (legacy records) is ignored.
     signoffs: Dict[str, Dict[str, Any]] = {}
+    ws_name = Path(ws).name
     for entity in approved.get("entities") or []:
         if not isinstance(entity, dict) or str(entity.get("status") or "").lower() != "approved":
             continue
         for record in entity.get("evidence") or []:
-            if isinstance(record, dict) and record.get("kind") == "signoff" and record.get("cluster_id"):
+            if isinstance(record, dict) and record.get("kind") == "signoff" \
+                    and record.get("cluster_id") \
+                    and str(record.get("workspace") or "") == ws_name:
                 signoffs[str(record["cluster_id"])] = entity
     slots = slots_from_approved(approved, ev.get("visual"))
     entities = [dict(e) for e in (approved.get("entities") or []) if isinstance(e, dict)]
