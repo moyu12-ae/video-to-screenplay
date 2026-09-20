@@ -7,6 +7,12 @@ Implements the single-project workspace architecture:
   ├── materials/       (read-only video and external subtitle assets)
   ├── output/          (final clean screenplay deliverables)
   └── .cache/          (hidden sandbox for intermediate json, keyframes, and debug artifacts)
+
+A workspace may bind a series-level config directory (v0.6 P-1, see series.py):
+
+  <workspace>/.v2s-series      pointer to <series_root>/ holding cast.approved.json
+                               and op_ed_windows.json; the table is snapshotted
+                               into .cache/ so the episode stays reproducible
 """
 
 import argparse
@@ -20,6 +26,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 import omni_client
+import series
 
 
 def safe_workspace_path(path: str) -> str:
@@ -29,8 +36,11 @@ def safe_workspace_path(path: str) -> str:
     return abs_path
 
 
-def init_workspace(workspace_root: str) -> Dict[str, str]:
-    """Create the standard project workspace layout."""
+def init_workspace(workspace_root: str, series_root: str | None = None) -> Dict[str, Any]:
+    """Create the standard project workspace layout. With --series, bind the
+    workspace to a series-level config directory (v0.6 P-1) so the approved
+    cast table and OP/ED windows are configured once per season instead of
+    copied per episode."""
     ws = safe_workspace_path(workspace_root)
     dirs = {
         "root": ws,
@@ -46,7 +56,10 @@ def init_workspace(workspace_root: str) -> Dict[str, str]:
     }
     for d in dirs.values():
         os.makedirs(d, exist_ok=True)
-    return dirs
+    result: Dict[str, Any] = {"directories": dirs}
+    if series_root:
+        result["series"] = series.bind_series(ws, series_root)
+    return result
 
 
 def probe_materials(workspace_root: str) -> Dict[str, Any]:
@@ -241,6 +254,10 @@ def main():
     # Init
     init_parser = subparsers.add_parser("init", help="Initialize project directory layout")
     init_parser.add_argument("--workspace", "-w", required=True, help="Path to workspace root")
+    init_parser.add_argument("--series", "-s", default=None,
+                             help="Optional series-level config directory to bind (created if "
+                                  "missing). Holds cast.approved.json and op_ed_windows.json; "
+                                  "the workspace stores a .v2s-series pointer and a cast snapshot")
 
     # Probe
     probe_parser = subparsers.add_parser("probe", help="Probe materials for video and subtitle tracks")
@@ -258,13 +275,26 @@ def main():
     doctor_parser = subparsers.add_parser("doctor", help="Inspect runtime environment, audio-visual tools and model assets")
     doctor_parser.add_argument("--workspace", "-w", default=None, help="Optional workspace to inspect")
 
+    # Series binding / status
+    series_parser = subparsers.add_parser(
+        "series", help="Report or change the series-level config this workspace uses")
+    series_parser.add_argument("--workspace", "-w", required=True, help="Path to workspace root")
+    series_parser.add_argument("--bind", default=None, metavar="SERIES_ROOT",
+                               help="Bind to this series directory and snapshot its cast table")
+
     args = parser.parse_args()
 
     if args.command == "doctor":
         run_doctor_check()
     elif args.command == "init":
-        dirs = init_workspace(args.workspace)
-        sys.stdout.write(json.dumps({"status": "initialized", "directories": dirs}, indent=2) + "\n")
+        info = init_workspace(args.workspace, args.series)
+        sys.stdout.write(json.dumps({"status": "initialized", **info}, ensure_ascii=False, indent=2) + "\n")
+    elif args.command == "series":
+        if args.bind:
+            out = series.bind_series(args.workspace, args.bind)
+        else:
+            out = series.series_status(args.workspace)
+        sys.stdout.write(json.dumps(out, ensure_ascii=False, indent=2) + "\n")
     elif args.command == "probe":
         probe_res = probe_materials(args.workspace)
         sys.stdout.write(json.dumps(probe_res, ensure_ascii=False, indent=2) + "\n")

@@ -2,10 +2,14 @@
 """
 scripts/op_ed.py - OP/ED window configuration and matching (v0.5.1).
 
-Windows come from ONE place: materials/bible.json →
+Windows come from ONE reading path, series.load_op_ed_windows():
 
     {"op_ed_windows": [{"start_ms": 84000, "end_ms": 105000, "label": "OP"},
                        {"start_ms": 1320000, "end_ms": 1440000, "label": "ED"}]}
+
+in <series_root>/op_ed_windows.json when the workspace is bound to a series
+(v0.6 P-1, configured once for the whole season), else materials/bible.json in
+the workspace - the legacy per-episode location, still fully supported.
 
 Measured once per series, reused for the whole season. No configuration means
 no filtering anywhere - every stage keeps its pre-0.5.1 behaviour.
@@ -17,34 +21,22 @@ final screenplay marks the position with a one-line （动画 OP/ED） note inst
 of narrative scenes.
 """
 
-import json
 import sys
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import series
 
 OP_ED_OVERLAP_RATIO = 0.5
 
 
 def load_windows(ws: Optional[str]) -> List[Dict[str, Any]]:
-    """Read op_ed_windows from materials/bible.json. Malformed entries are
-    skipped with a warning; missing file/field means no filtering."""
+    """Read OP/ED windows (series directory first, legacy bible.json second).
+    Malformed entries are skipped with a warning; no windows means no
+    filtering."""
     if not ws:
         return []
-    bible = Path(ws, "materials", "bible.json")
-    if not bible.is_file():
-        return []
-    try:
-        doc = json.loads(bible.read_text(encoding="utf-8"))
-    except Exception as e:
-        sys.stderr.write(f"[WARN] Cannot parse bible.json, OP/ED windows ignored: {e}\n")
-        return []
-    raw = doc.get("op_ed_windows") if isinstance(doc, dict) else None
-    if not isinstance(raw, list):
-        return []
     windows: List[Dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
+    for entry in series.load_op_ed_windows(ws):
         try:
             s, e = int(entry["start_ms"]), int(entry["end_ms"])
         except (KeyError, TypeError, ValueError):

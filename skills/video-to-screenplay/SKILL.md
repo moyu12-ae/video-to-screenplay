@@ -81,7 +81,12 @@ python3 scripts/workspace.py doctor
 ```
 
 - 🔑 **API key 前置检查**：`doctor` 报告 `diarization.dashscope_api_key`（只含 `"set"`/`"missing"`，绝不含 key 值）。为 `missing` 时**必须**用 `AskUserQuestion` 让用户三选一：① 现在配置 `DASHSCOPE_API_KEY` 后重跑检查；② 明确选择"无声学归属继续"（说话人列留空；阶段 2 仍可走 MCP 回退路径 B）；③ 中止流水线。**绝不静默降级**。
-- 🎬 **OP/ED 窗口（可选，推荐）**：用户不想要 OP/ED 内容时，在 `materials/bible.json` 配置一次、全季通用：
+- 🎬 **OP/ED 窗口（可选，推荐）**：用户不想要 OP/ED 内容时，二选一配置：
+  - **整季通用**（v0.6 起）：`python3 scripts/workspace.py init --workspace "<ws>" --series "<系列根>"`，
+    把窗口写进 `<系列根>/op_ed_windows.json`。同一系列目录下的每一集都自动沿用，不必逐集拷贝；
+    绑定还会把当时的演员表快照进 `.cache/cast.series.snapshot.json`（可复现）。
+  - **单集**：写在 `materials/bible.json` 的 `op_ed_windows` 字段（旧版行为，完全支持）。
+  两处都有且**不一致**时用系列目录并在 stderr 告警；一致则静默。
   ```json
   {"op_ed_windows": [{"start_ms": 84000, "end_ms": 105000, "label": "OP"},
                      {"start_ms": 1320000, "end_ms": 1440000, "label": "ED"}]}

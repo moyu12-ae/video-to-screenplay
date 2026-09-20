@@ -434,7 +434,11 @@ A3 (6)            → 黑发×1、红发×1（平票）   静默负对照(2) →
 
 ## 10. 分批提交计划
 
-0. **P-1 系列目录 + 修掉"全季通用"假承诺**：`workspace.py init --series`、快照 `.v2s-series`、
+0. **P-1 系列目录 + 修掉"全季通用"假承诺** ✅ **已落地**（`scripts/series.py` + `workspace.py init --series`
+   + `workspace.py series` 状态查询；`op_ed.load_windows` 改为单一读取路径、系列优先、bible 兜底；
+   SKILL/`commands/init.md` 措辞按实际行为改写。实测：未绑定时行为与 v0.5.x 逐字节一致，
+   绑定后两集各自读到同一 2 条窗口与 2 个已签核实体，系列表读取后未被改动）：
+   `workspace.py init --series`、快照 `.v2s-series`、
    `op_ed_windows` 搬家。**先做这个**——演员表要住在这里，没有它后面全部落不了地。
 1. **P0 声学属性**：diarize prompt + normalize + 簇聚合多数票。最小、零额外调用、可独立验证。
 2. **P1 呼语抽取 + lint 方向反转**：纯本地字符串规则；先把"我这轮犯的错"和那个「…的声音」后缀偏置

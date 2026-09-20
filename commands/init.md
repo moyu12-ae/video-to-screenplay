@@ -14,9 +14,10 @@ Paths below are relative to this plugin's root (the directory holding
 ## Steps
 
 ```bash
-python3 scripts/workspace.py init  --workspace "<ws>"
+python3 scripts/workspace.py init  --workspace "<ws>" [--series "<series root>"]
 python3 scripts/workspace.py probe --workspace "<ws>"
 python3 scripts/workspace.py doctor
+python3 scripts/workspace.py series --workspace "<ws>"   # what this episode actually resolves to
 ```
 
 1. **Key gate.** `doctor` reports `diarization.dashscope_api_key` as `set`/`missing` (never the value)
@@ -27,8 +28,10 @@ python3 scripts/workspace.py doctor
 3. **Subtitle gate.** Decide the tier: external `.srt`/`.ass` file → embedded soft stream → OCR. If only
    OCR can serve the source, the extractor exits 6 with the Tier 3 instruction on stdout; follow it.
    Refuse dialogue-free footage only after the user confirms it (`check-subtitles --mode none`, exit 5).
-4. Offer the optional OP/ED windows (`materials/bible.json` → `op_ed_windows`) once per series, so
-   opening/ending lyrics never become "scenes" or singer-clusters.
+4. Offer the optional OP/ED windows once per series so opening/ending lyrics never become "scenes" or
+   singer-clusters. Series-wide means `<series_root>/op_ed_windows.json`, which requires `--series` at
+   init; without a binding the same field lives in that episode's `materials/bible.json` and has to be
+   copied per episode. `series --workspace` prints which one is in force.
 
 ## Stop-checkpoint
 
