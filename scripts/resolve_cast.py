@@ -595,14 +595,18 @@ def resolve(ws: Path, ev: Dict[str, Any]) -> Dict[str, Any]:
     # clusters is the anomaly we CAN see (two clusters, same face seen talking).
     # The opposite - one cluster carrying several people - is invisible from this
     # evidence, so no field claims to detect it.
-    by_visual_top: Dict[str, List[str]] = {}
-    for assignment in assignments:
-        top = assignment.get("visual_top_slot")
-        if top:
-            by_visual_top.setdefault(top, []).append(assignment["cluster_id"])
-    over_split = [{"slot_id": slot, "clusters": sorted(clusters),
-                   "note": "两个人类簇的视觉正证据指向同一画像，怀疑声学过度切分"}
-                  for slot, clusters in sorted(by_visual_top.items()) if len(clusters) > 1]
+    # Reverse audit of the separation layer, done on the RAW visible labels:
+    # "two clusters, the same face seen talking during both their lines" needs no
+    # cast table and no names, so keying it to signed-off slots would hide the one
+    # structural signal this channel can give for free - and on episode one there is
+    # no table yet, which is exactly when over-splitting matters most.
+    by_label: Dict[str, List[str]] = {}
+    for cid, votes in (ev["visual"].get("by_cluster") or {}).items():
+        for label in (votes or {}):
+            by_label.setdefault(str(label), []).append(str(cid))
+    over_split = [{"visual_label": label, "clusters": sorted(cids),
+                   "note": "两个人类簇的语音窗里同一张脸在说话，怀疑声学过度切分"}
+                  for label, cids in sorted(by_label.items()) if len(cids) > 1]
 
     abstained = [a for a in assignments if a["assignment"]["status"] == "unknown"]
     doc = {

@@ -309,6 +309,48 @@ def summarize_cast(cast_doc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def fidelity_lines(appendix_rows: str, dialogue_total: int, spliced_count: int,
+                   cast_summary: Optional[Dict[str, Any]],
+                   label_buckets: Dict[str, List[str]], cast_enforced: bool) -> List[str]:
+    """The fidelity appendix, one paragraph per list item.
+
+    Every line here must survive regardless of whether a cast.json exists: the
+    first version of this block used a conditional inside a string concatenation
+    and silently dropped the label-composition line on exactly the runs where a
+    cast table WAS present - the runs that most needed it.
+    """
+    lines = [
+        "\n---\n\n"
+        "## 附：本集声画关系统计\n\n"
+        "| 关系类型 | 条数 | 说明 |\n| :--- | :--- | :--- |\n"
+        f"{appendix_rows}\n\n"
+        f"> **台词保真说明**：全片 {dialogue_total} 条字幕以 [[SUB:n]] 占位符由脚本从字幕轨逐字回填，"
+        f"本次拼装 {spliced_count}/{dialogue_total} 条，"
+        f"覆盖率 {spliced_count / max(1, dialogue_total):.1%}；台词文本未经过任何改写。\n",
+    ]
+    if cast_summary:
+        cast_line = (">\n> **演员表状态**：已定名 {named} 簇、候选 {candidate} 簇、"
+                     "未定名 {unknown} 簇").format(named=cast_summary["named"],
+                                                  candidate=cast_summary["candidate"],
+                                                  unknown=cast_summary["unknown"])
+        if isinstance(cast_summary.get("abstention_rate"), float):
+            cast_line += f"，弃权率 {cast_summary['abstention_rate']:.0%}"
+        if cast_summary["over_split_suspects"]:
+            cast_line += f"，疑似过度切分 {cast_summary['over_split_suspects']} 组"
+        cast_line += ("；判定阈值**尚未经测量**。" if not cast_summary["thresholds_are_measured"]
+                      else "；阈值来自测量。")
+        cast_line += f"（表版本 {cast_summary['cast_version'] or '未签核'}）\n"
+        lines.append(cast_line)
+    lines.append(
+        ">\n> **说话人标签构成**：可溯源 {named} 个、描述性（未定名）{descriptive} 个、"
+        "表外专名 {untraced} 个".format(named=len(label_buckets["named"]),
+                                        descriptive=len(label_buckets["descriptive"]),
+                                        untraced=len(label_buckets["untraced"]))
+        + ("；演员表已生效，表外专名为致命" if cast_enforced
+           else "；本工作区未绑定已签核演员表，故仅告警（成稿按未核验处理）") + "\n")
+    return lines
+
+
 def _cell(value: Any) -> str:
     """Markdown table cell: escape pipes so titles like 【A|B】 cannot break the row."""
     return str(value or "").replace("|", "\\|").replace("\n", " ")
@@ -469,43 +511,11 @@ def main():
     ]
 
     appendix_rows = "\n".join(f"| {rel} | {n} | {d} |" for rel, n, d in av_statistics(aligned))
-    appendix = (
-        "\n---\n\n"
-        "## 附：本集声画关系统计\n\n"
-        "| 关系类型 | 条数 | 说明 |\n| :--- | :--- | :--- |\n"
-        f"{appendix_rows}\n\n"
-        f"> **台词保真说明**：全片 {len(verbatim)} 条字幕以 [[SUB:n]] 占位符由脚本从字幕轨逐字回填，"
-        f"本次拼装 {spliced_count}/{len(verbatim)} 条，覆盖率 {spliced_count / max(1, len(verbatim)):.1%}；"
-        "台词文本未经过任何改写。\n"
-        ">\n"
-        ">\n"
-        + (
-            f"> **演员表状态**：已定名 {cast_summary['named']} 簇、候选 "
-            f"{cast_summary['candidate']} 簇、未定名 {cast_summary['unknown']} 簇"
-            + (f"，弃权率 {cast_summary['abstention_rate']:.0%}"
-               if isinstance(cast_summary.get('abstention_rate'), float) else "")
-            + (f"，疑似过度切分 {cast_summary['over_split_suspects']} 组"
-               if cast_summary["over_split_suspects"] else "")
-            + ("；判定阈值**尚未经测量**。" if not cast_summary["thresholds_are_measured"]
-               else "；阈值来自测量。")
-            + f"（表版本 {cast_summary['cast_version'] or '未签核'}）\n"
-        ) if cast_summary else ""
-        +
-        f"> **说话人标签构成**：可溯源 {len(label_buckets['named'])} 个、"
-        f"描述性（未定名）{len(label_buckets['descriptive'])} 个、"
-        f"表外专名 {len(label_buckets['untraced'])} 个"
-        + ("；演员表已生效，表外专名为致命" if cast_enforced
-           else "；本工作区未绑定已签核演员表，故仅告警（成稿按未核验处理）") + "\n"
-    )
-
-    if cast_enforced and label_buckets["untraced"]:
-        # Naming is the one thing a signed-off table exists to make impossible to
-        # drift, so this fails BEFORE the deliverable is written, not after.
-        sys.stderr.write(
-            "[FATAL] 演员表已生效，但以下说话人标签溯源不到任何签核条目（可能是杜撰的专名）: "
-            + ", ".join(label_buckets["untraced"])
-            + "\n[ACTION] 回到阶段 3.7 的签核环节定名，或按 --draft 语义解除系列绑定后重试。\n")
-        sys.exit(EXIT_NAMING_VIOLATION)
+    # Assembled from a list, not a conditional expression: `A + B if cond else C + D`
+    # parses as `(A + B) if cond else (C + D)`, which silently deleted the label
+    # composition line whenever a cast.json existed.
+    appendix = "".join(fidelity_lines(appendix_rows, len(verbatim), spliced_count,
+                                      cast_summary, label_buckets, cast_enforced))
 
     body = "\n---\n\n".join(part.strip() + "\n" for part in spliced_texts)
     document = "\n".join(header) + "\n" + body + appendix

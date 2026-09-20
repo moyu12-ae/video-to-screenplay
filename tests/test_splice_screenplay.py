@@ -277,6 +277,45 @@ class TestSpeakerLineageGate(unittest.TestCase):
         self.assertIsNone(sp.cast_lineage_names(None))
 
 
+class TestFidelityAppendix(unittest.TestCase):
+    """Every line must appear whether or not a cast.json exists. The first
+    implementation put a conditional inside a string concatenation, so
+    `A + B if cast else C + D` dropped the label-composition line precisely on
+    the runs that most needed it."""
+
+    BUCKETS = {"named": ["托德"], "descriptive": ["女声", "系统音"], "untraced": []}
+    CAST = {"named": 1, "candidate": 0, "unknown": 3, "abstention_rate": 0.6,
+            "over_split_suspects": 1, "thresholds_are_measured": False, "cast_version": "4"}
+
+    def _text(self, cast_summary, enforced):
+        return "".join(sp.fidelity_lines("| ON_SCREEN | 3 | x |", 15, 15,
+                                        cast_summary, self.BUCKETS, enforced))
+
+    def test_with_cast_table(self):
+        text = self._text(self.CAST, True)
+        self.assertIn("说话人标签构成", text)
+        self.assertIn("演员表状态", text)
+        self.assertIn("疑似过度切分 1 组", text)
+        self.assertIn("尚未经测量", text)
+        self.assertIn("表外专名为致命", text)
+
+    def test_without_cast_document(self):
+        text = self._text(None, False)
+        self.assertIn("说话人标签构成", text)
+        self.assertIn("可溯源 1 个、描述性（未定名）2 个、表外专名 0 个", text)
+        self.assertNotIn("演员表状态", text)
+        self.assertIn("仅告警", text)
+
+    def test_line_counts_survive_zero_everything(self):
+        text = self._text({"named": 0, "candidate": 0, "unknown": 0, "abstention_rate": 0.0,
+                           "over_split_suspects": 0, "thresholds_are_measured": True,
+                           "cast_version": None}, True)
+        self.assertIn("弃权率 0%", text)
+        self.assertIn("阈值来自测量", text)
+        self.assertNotIn("疑似过度切分", text)
+        self.assertIn("表版本 未签核", text)
+
+
 class TestHeadingNormalization(unittest.TestCase):
 
     def test_legacy_draft_gets_title_from_slug_and_manifest_tc(self):

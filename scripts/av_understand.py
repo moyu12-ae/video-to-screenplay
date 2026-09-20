@@ -68,6 +68,11 @@ MOUTH_STATES = ("moving", "still", "not_visible")
 # one channel that is supposed to be high-precision.
 MOUTH_MOTIONS = ("speaking", "chewing", "yawning", "other", "not_applicable")
 MOUTH_COMPLIANCE_MIN = 0.80  # below this the channel is NOT usable (see §10 P3)
+# Upstream rejects a clip this short outright (measured on ep02 09:18: a 0.5 s scene
+# produced a 62 KB MP4 and got `bad_request (400)`), and the pass then could never
+# finish - a scene nobody can be asked about must degrade to a coverage gap, not
+# become a permanent blocker that re-bills on every retry.
+AV_MIN_SEGMENT_SEC = 1.5
 AV_MOUTH_MAX_WINDOW_SEC = 3.0  # limited animation loops a mouth in ~0.5-1s; longer
 #                                 windows cannot localise who is talking, so the
 #                                 prompt is asked to split anything bigger
@@ -128,6 +133,19 @@ def build_prompt(start_ms: int, end_ms: int) -> str:
 # pure planning / mapping / coverage
 # ---------------------------------------------------------------------------
 
+def short_scenes(scenes: List[Dict[str, Any]],
+                 min_sec: float = AV_MIN_SEGMENT_SEC) -> List[Dict[str, Any]]:
+    """Scenes too short to ask anyone about - listed, never silently dropped."""
+    out = []
+    for sc in scenes:
+        if not isinstance(sc, dict):
+            continue
+        dur = int(sc.get("end_ms", 0)) - int(sc.get("start_ms", 0))
+        if 0 < dur < int(min_sec * 1000):
+            out.append({"scene_id": str(sc.get("scene_id", "")), "duration_ms": dur})
+    return out
+
+
 def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_SEC,
                   overlap_sec: float = AV_OVERLAP_SEC) -> List[Dict[str, Any]]:
     """Split each scene into windows of at most segment_sec seconds, with
@@ -144,8 +162,8 @@ def plan_segments(scenes: List[Dict[str, Any]], segment_sec: float = AV_SEGMENT_
     for sc in scenes:
         sid = str(sc.get("scene_id", ""))
         s0, s1 = int(sc.get("start_ms", 0)), int(sc.get("end_ms", 0))
-        if s1 <= s0:
-            continue
+        if s1 <= s0 or s1 - s0 < int(AV_MIN_SEGMENT_SEC * 1000):
+            continue  # reported via short_scenes(), so the gap stays visible
         start = s0
         while start < s1:
             end = min(s1, start + max_len)
@@ -412,6 +430,11 @@ def cmd_prepare(ws: Optional[str], segment_sec: float, video_override: Optional[
     # watching the opening credits produces staff-list evidence nobody weaves in.
     op_ed_windows = op_ed.load_windows(ws)
     kept_segments: List[Dict[str, Any]] = []
+    too_short = short_scenes(scenes)
+    for sc in too_short:
+        sys.stderr.write(f"[SKIP] {sc['scene_id']} {sc['duration_ms'] / 1000.0:.1f}s: shorter than "
+                         f"{AV_MIN_SEGMENT_SEC}s - upstream rejects clips this small, so this scene "
+                         "is reported as a coverage gap and the writer falls back to keyframes\n")
     skipped_op_ed: List[Dict[str, Any]] = []
     for seg in segments:
         label = op_ed.matching_label(seg["start_ms"], seg["end_ms"], op_ed_windows)
@@ -453,6 +476,7 @@ def cmd_prepare(ws: Optional[str], segment_sec: float, video_override: Optional[
                             "uncertain": []},
         "op_ed_windows": op_ed_windows,
         "skipped_op_ed": skipped_op_ed,
+        "skipped_too_short": too_short,
         "scenes": [{"scene_id": s["scene_id"], "start_ms": s.get("start_ms", 0),
                     "end_ms": s.get("end_ms", 0)} for s in scenes],
         "segments": entries,

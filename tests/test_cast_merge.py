@@ -99,6 +99,8 @@ class TestOverSplitAudit(unittest.TestCase):
                 "address": {"events": [], "terms": {}, "not_speaker": {}},
                 "visual": {"clips_total": 3, "clips_visual_usable": 3, "clips_positive": 3,
                            "anchors": {"positive_by_anchor": {"金发青年": 3}},
+                           "by_cluster": {"SPEAKER_A1": {"金发青年": 2},
+                                          "SPEAKER_A2": {"金发青年": 1}},
                            "available": True}}
 
     def test_two_clusters_sharing_one_face_are_flagged(self):
@@ -106,7 +108,23 @@ class TestOverSplitAudit(unittest.TestCase):
         suspects = doc["over_split_suspects"]
         self.assertEqual(len(suspects), 1)
         self.assertEqual(suspects[0]["clusters"], ["SPEAKER_A1", "SPEAKER_A2"])
-        self.assertEqual(suspects[0]["slot_id"], "S1")
+        self.assertEqual(suspects[0]["visual_label"], "金发青年")
+
+    def test_the_audit_works_before_any_cast_table_exists(self):
+        """Measured on ep02 09:18: two female clusters both showed 红发校服少女
+        talking during their lines. Keying this audit to signed-off slots made it
+        invisible precisely on episode one, where over-splitting is the live risk -
+        the signal costs nothing and needs no names."""
+        ev = self._two_clusters_one_face()
+        ev["approved"] = {"entities": []}
+        ev["visual"]["by_cluster"] = {"SPEAKER_A1": {"红发校服少女": 3},
+                                      "SPEAKER_A2": {"红发校服少女": 2}}
+        doc = resolve_cast.resolve(Path("/tmp"), ev)
+        self.assertEqual(doc["over_split_suspects"][0]["clusters"],
+                         ["SPEAKER_A1", "SPEAKER_A2"])
+        self.assertEqual(doc["over_split_suspects"][0]["visual_label"], "红发校服少女")
+        self.assertEqual(doc["abstention"]["rate"], 1.0,
+                         "no table means no auto-merge; the audit is separate")
 
     def test_the_audit_is_one_directional(self):
         """Several people inside one cluster cannot be seen from this evidence, so

@@ -124,6 +124,34 @@ class TestPerClusterWindowing(unittest.TestCase):
         self.assertFalse(entry["visual_trusted"])
 
 
+class TestUnservableSliver(unittest.TestCase):
+    """Measured on ep02 09:18: the grouper produced a 0.5 s macro scene, the clip
+    encoded to 62 KB, and upstream answered `bad_request (400)` - which made the
+    whole AV pass exit 7 forever, on a scene nobody could be asked about.
+    Below the floor the scene is reported as a gap instead of becoming a permanent
+    blocker that re-bills on every retry."""
+
+    SCENES = [{"scene_id": "SCENE_02", "start_ms": 8000, "end_ms": 9600},
+              {"scene_id": "SCENE_03", "start_ms": 9600, "end_ms": 10100},
+              {"scene_id": "SCENE_04", "start_ms": 10100, "end_ms": 20000}]
+
+    def test_short_scene_is_listed_not_planned(self):
+        short = av.short_scenes(self.SCENES)
+        self.assertEqual([s["scene_id"] for s in short], ["SCENE_03"])
+        planned = av.plan_segments(self.SCENES)
+        self.assertNotIn("SCENE_03", {seg["scene_id"] for seg in planned})
+        self.assertTrue(all(seg["end_ms"] - seg["start_ms"] >= av.AV_MIN_SEGMENT_SEC * 1000
+                            for seg in planned))
+
+    def test_the_gap_stays_visible(self):
+        """Skipping is only honest if the scene is still counted, so coverage - not
+        a silent hole - is what reports it."""
+        self.assertEqual(av.short_scenes([{"scene_id": "S", "start_ms": 0, "end_ms": 100}]),
+                         [{"scene_id": "S", "duration_ms": 100}])
+        self.assertEqual(av.short_scenes([{"scene_id": "S", "start_ms": 5, "end_ms": 5}]), [],
+                         "a zero-length scene is not a coverage gap, it is bad input")
+
+
 class TestNoCrossClusterContamination(unittest.TestCase):
     """Measured regression: a cluster that overlaps no speaking face fell back to
     the EPISODE-wide positives and inherited someone else's evidence, because
