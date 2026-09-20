@@ -785,7 +785,8 @@ class TestAvUnderstand(unittest.TestCase):
         }, 420_000, 510_000)
         self.assertEqual(note["visual"]["caption"], "雨夜")
         self.assertEqual(note["visual"]["actions"],
-                         [{"who": "红衣女子", "what": "拔刀", "start": 421_500, "end": 423_000}])
+                         [{"who": "红衣女子", "what": "拔刀", "start": 421_500, "end": 423_000,
+                           "mouth_state": "unknown"}])
         self.assertEqual(note["visual"]["camera"][0]["start"], 420_000)
         self.assertEqual(note["visible_text"], [])
         self.assertEqual(note["acoustic"]["events"][0]["start"], 422_200)
@@ -801,8 +802,10 @@ class TestAvUnderstand(unittest.TestCase):
                 {"start": "00:01:05", "end": "00:01:08", "who": "老者", "what": "驻足"}]},
         }, 100_000, 190_000)
         self.assertEqual(note["visual"]["actions"],
-                         [{"who": "红衣女子", "what": "撑伞快走", "start": 105_000, "end": 108_000},
-                          {"who": "老者", "what": "驻足", "start": 165_000, "end": 168_000}])
+                         [{"who": "红衣女子", "what": "撑伞快走", "start": 105_000, "end": 108_000,
+                           "mouth_state": "unknown"},
+                          {"who": "老者", "what": "驻足", "start": 165_000, "end": 168_000,
+                           "mouth_state": "unknown"}])
 
     def test_parse_note_drops_out_of_timebase_and_counts(self):
         """A 200s timestamp inside a 90s window means the model ignored the local
@@ -911,7 +914,7 @@ class TestAvUnderstand(unittest.TestCase):
         stub.assert_called_once()
         self.assertTrue((av_dir / "av_note_000.json").is_file())
         notes = json.loads((ws / ".cache" / "visual" / "av_notes.json").read_text(encoding="utf-8"))
-        self.assertEqual(notes["schema"], "vts-av-notes/v2")
+        self.assertEqual(notes["schema"], "vts-av-notes/v3")
         self.assertEqual(notes["scene_notes"][0]["covered_pct"], 100.0)
         self.assertEqual(notes["scene_notes"][0]["segments"][0]["visual"]["actions"][0]["start"],
                          1_000)  # local 1.0s -> absolute 1000ms
@@ -1289,15 +1292,15 @@ class TestV052ContractGaps(unittest.TestCase):
             self.assertNotIn("[[SUB:", stub)
 
     def test_stale_av_notes_schema_is_reported(self):
-        from build_scene_manifest import build_manifest
+        import build_scene_manifest
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
             self._op_ed_ws(ws, [], schema="vts-av-notes/v1")
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                build_manifest(ws, max_keyframes=4)
+                build_scene_manifest.build_manifest(ws, max_keyframes=4)
             self.assertIn("vts-av-notes/v1", err.getvalue())
-            self.assertIn("vts-av-notes/v2", err.getvalue())
+            self.assertIn(build_scene_manifest.EXPECTED_AV_NOTES_SCHEMA, err.getvalue())
 
     def test_manifest_schema_constant_matches_the_producer(self):
         import build_scene_manifest

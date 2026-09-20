@@ -29,10 +29,12 @@ APPROVED = {
     "entities": [
         {"id": "C1", "canonical_name": "茉里", "status": "approved", "aliases": ["マリー"],
          "voice_profile": {"gender": "female", "age_band": "teen", "timbre": "bright"},
+         "visual_label": "黑发齐刘海少女",
          "visual_anchors": [{"desc": "黑发齐刘海", "first_seen_ms": 340000}],
          "approved_by": "human", "approved_at": "2026-09-19"},
         {"id": "C2", "canonical_name": "托德", "status": "approved", "aliases": [],
          "voice_profile": {"gender": "male", "age_band": "young_adult", "timbre": "low"},
+         "visual_label": "金发青年",
          "visual_anchors": [{"desc": "金发、青绿外套", "first_seen_ms": 361000}],
          "approved_by": "human", "approved_at": "2026-09-19"},
     ],
@@ -44,8 +46,10 @@ def _evidence(clusters, terms=None, anchors=None, approved=None):
         "approved": APPROVED if approved is None else approved,
         "acoustic": clusters,
         "address": {"events": [], "terms": terms or {}, "not_speaker": {}},
-        "visual": {"clips_total": 6, "clips_visual_usable": 4, "clips_positive": 2,
-                   "anchors": {"positive_by_anchor": anchors or {}}, "available": bool(anchors)},
+        "visual": {"clips_total": 6, "clips_visual_usable": 4,
+                   "clips_positive": sum((anchors or {}).values()),
+                   "anchors": {"positive_by_anchor": anchors or {}, "states_seen": {}},
+                   "available": bool(anchors)},
     }
 
 
@@ -71,7 +75,7 @@ class TestMatchingPriority(unittest.TestCase):
         self.assertEqual(len(doc["pending"]), 1)
 
     def test_two_agreeing_families_inherit_the_approved_identity(self):
-        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN}, anchors={"茉里": 3})
+        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN}, anchors={"黑发齐刘海少女": 3})
         doc = resolve_cast.resolve(Path("/tmp"), ev)
         assignment = doc["clusters"][0]["assignment"]
         self.assertEqual(assignment["slot_id"], "S1")
@@ -88,10 +92,11 @@ class TestMatchingPriority(unittest.TestCase):
                                  "aliases": [],
                                  "voice_profile": {"gender": "female", "age_band": "teen",
                                                    "timbre": "bright"},
+                                 "visual_label": "黑发双马尾",
                                  "visual_anchors": [{"desc": "黑发双马尾"}],
                                  "approved_by": "human", "approved_at": "2026-09-19"})
         ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN},
-                       anchors={"茉里": 3, "茉里子": 3}, approved=twin)
+                       anchors={"黑发齐刘海少女": 3, "黑发双马尾": 3}, approved=twin)
         doc = resolve_cast.resolve(Path("/tmp"), ev)
         assignment = doc["clusters"][0]["assignment"]
         self.assertEqual(assignment["matched_via"], "new_slot")
@@ -151,7 +156,7 @@ class TestNamingIsNeverProduced(unittest.TestCase):
     def test_no_address_term_is_ever_used_to_attribute_a_line(self):
         """An address term appears in the document as a naming candidate for the
         human table and as an exclusion - never as support for who spoke."""
-        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN}, terms={"茉里": 2}, anchors={"茉里": 3})
+        ev = _evidence({"SPEAKER_A1": CLUSTER_FEMALE_TEEN}, terms={"茉里": 2}, anchors={"黑发齐刘海少女": 3})
         ev["address"]["not_speaker"] = {"SPEAKER_A1": ["茉里"]}
         doc = resolve_cast.resolve(Path("/tmp"), ev)
         dumped = json.dumps(doc, ensure_ascii=False)

@@ -56,7 +56,16 @@ AV_OVERLAP_SEC = 5.0           # between segments of the SAME scene only
 AV_FOLD_TAIL_SEC = 10.0        # a tail shorter than this folds into the last window,
                                # which may then run up to segment_sec + AV_FOLD_TAIL_SEC -
                                # otherwise a 5 s sliver would cost a full API call
-AV_NOTES_SCHEMA = "vts-av-notes/v2"
+AV_NOTES_SCHEMA = "vts-av-notes/v3"  # v2 -> v3 adds per-action mouth_state (v0.6 P3)
+# The three states the ASD channel may report. `unknown` is what an illegal or
+# absent value becomes - never a guess, and never folded into `still`, because
+# "mouth not moving" is weak evidence while "could not see the mouth" is no
+# evidence at all (§7's one-sided rule).
+MOUTH_STATES = ("moving", "still", "not_visible")
+MOUTH_COMPLIANCE_MIN = 0.80  # below this the channel is NOT usable (see §10 P3)
+AV_MOUTH_MAX_WINDOW_SEC = 3.0  # limited animation loops a mouth in ~0.5-1s; longer
+#                                 windows cannot localise who is talking, so the
+#                                 prompt is asked to split anything bigger
 
 AV_UNDERSTAND_PROMPT = """You are a rigorous, objective audio-visual analyst for a screenplay
 reconstruction pipeline. Watch this clip and report ONLY what is truly visible and audible.
@@ -75,9 +84,17 @@ HARD RULES:
 - All "what" / "movement" / "appearance" / "music_mood" / "uncertain" values must be written in
   natural Chinese - they feed a Chinese screenplay writer. Concrete and filmable: write light,
   objects, bodies, sound - never inner feelings.
+- For every action, also report mouth_state for the person named in "who", judged ONLY from
+  whether their mouth visibly opens and closes during that window: "moving" (it does, repeatedly),
+  "still" (their mouth is visible and stays shut), "not_visible" (face turned away, off screen,
+  too small, or they are not in frame). Never infer mouth_state from speech timing, subtitles, or
+  context - if you cannot see it, write "not_visible".
+- Keep each action window at most 3 seconds: split a longer continuous action into consecutive
+  windows, each describing what changes.
 - Output ONLY one JSON object inside a ```json fence, exactly this shape:
 {"visual": {"caption": "<2-3 句中文，概括整段画面>",
-   "actions": [{"start": <sec>, "end": <sec>, "who": "<描述性称呼>", "what": "<中文，具体可演的动作>"}],
+   "actions": [{"start": <sec>, "end": <sec>, "who": "<描述性称呼>", "what": "<中文，具体可演的动作>",
+     "mouth_state": "<moving|still|not_visible>"}],
    "camera": [{"start": <sec>, "end": <sec>, "movement": "<中文：景别/推拉摇移/手持/固定>"}],
    "scene_transition": "<中文：硬切/叠化/无>"},
  "visible_text": [{"start": <sec>, "end": <sec>, "text": "<屏显文字逐字>",
@@ -179,10 +196,11 @@ def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
     out-of-timebase entries are DROPPED AND COUNTED in note["dropped"] - never
     silently clamped into confident wrong timecodes. Never raises on bad data."""
     span_s = max(0.001, (end_ms - start_ms) / 1000.0)
-    dropped: Dict[str, int] = {"actions": 0, "camera": 0, "visible_text": 0, "acoustic_events": 0}
+    dropped: Dict[str, int] = {"actions": 0, "camera": 0, "visible_text": 0, "acoustic_events": 0,
+                               "mouth_state_invalid": 0}
 
     def timed(entries: Any, who_names: Tuple[str, ...], what_names: Tuple[str, ...],
-              channel: str) -> List[Dict[str, Any]]:
+              channel: str, mouth: bool = False) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for e in (entries if isinstance(entries, list) else []):
             if not isinstance(e, dict):
@@ -201,6 +219,12 @@ def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
             if who is not None:
                 row["who"] = str(who)
             row["what"] = str(what)
+            if mouth:
+                raw_state = _first(e, ("mouth_state", "mouth", "mouthState"))
+                state = str(raw_state or "").strip().lower()
+                row["mouth_state"] = state if state in MOUTH_STATES else "unknown"
+                if row["mouth_state"] == "unknown":
+                    dropped["mouth_state_invalid"] = dropped.get("mouth_state_invalid", 0) + 1
             out.append(row)
         return out
 
@@ -230,7 +254,8 @@ def parse_note(data: Any, start_ms: int, end_ms: int) -> Dict[str, Any]:
         "visual": {
             "caption": str(visual.get("caption") or ""),
             "actions": timed(visual.get("actions"), ("who", "epithet", "character", "person"),
-                             ("what", "description", "action", "content"), "actions"),
+                             ("what", "description", "action", "content"), "actions",
+                             mouth=True),
             "camera": timed(visual.get("camera"), (), ("movement", "camera", "shot"), "camera"),
             "scene_transition": str(visual.get("scene_transition") or ""),
         },
@@ -567,6 +592,39 @@ def cmd_run(ws: Optional[str], force: bool = False) -> None:
     sys.exit(EXIT_OK)
 
 
+def mouth_compliance(scene_notes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Did the model actually answer the P3 question, within the window size that
+    question requires?
+
+    Measured, not assumed: the <=3s per-action mouth_state rule is a prompt-
+    compliance bet, and a channel that silently returns nothing would otherwise be
+    consumed as "nobody's mouth moved" - which the design doc forbids, because
+    missing data must never read as evidence against a candidate.
+    """
+    counts = {state: 0 for state in MOUTH_STATES}
+    counts["unknown"] = 0
+    total = over = 0
+    for note in scene_notes:
+        for seg in note.get("segments") or []:
+            for action in ((seg.get("visual") or {}).get("actions") or []):
+                total += 1
+                state = str(action.get("mouth_state") or "unknown")
+                counts[state if state in counts else "unknown"] += 1
+                window_ms = int(action.get("end", 0)) - int(action.get("start", 0))
+                if window_ms > AV_MOUTH_MAX_WINDOW_SEC * 1000:
+                    over += 1
+    valid = sum(counts[state] for state in MOUTH_STATES)
+    return {
+        "actions_total": total,
+        "states": counts,
+        "valid_rate": round(valid / total, 3) if total else 0.0,
+        "windows_over_3s": over,
+        "window_compliance": round((total - over) / total, 3) if total else 0.0,
+        "usable": bool(total) and valid >= MOUTH_COMPLIANCE_MIN * total
+        and (total - over) >= MOUTH_COMPLIANCE_MIN * total,
+    }
+
+
 def cmd_merge(ws: Optional[str]) -> None:
     av_dir, work = _workorder(ws)
     scenes = {str(s["scene_id"]): s for s in work.get("scenes", []) if isinstance(s, dict)}
@@ -651,8 +709,10 @@ def cmd_merge(ws: Optional[str]) -> None:
                          "verbatim - on hard-subbed sources visible_text IS the dialogue; the writer "
                          "must treat them as evidence only, never as [[SUB:n]] material\n")
 
+    compliance = mouth_compliance(scene_notes)
     payload = json.dumps({
         "schema": AV_NOTES_SCHEMA,
+        "mouth_compliance": compliance,
         "scene_notes": scene_notes,
     }, ensure_ascii=False, indent=2) + "\n"
     notes_path = (Path(ws, ".cache", "visual", "av_notes.json") if ws
@@ -673,6 +733,7 @@ def cmd_merge(ws: Optional[str]) -> None:
         "covered_min": min(covs),
         "covered_avg": round(sum(covs) / len(covs), 1),
         "evidence": totals,
+        "mouth_compliance": compliance,
         "tokens": total_tokens,
         "notes_path": str(notes_path),
     }

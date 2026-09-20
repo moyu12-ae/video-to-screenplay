@@ -113,21 +113,48 @@ def address_evidence(aligned_doc: Any, known_names: List[str]) -> Dict[str, Any]
 
 
 def visual_evidence(av_doc: Any) -> Dict[str, Any]:
-    """Visible-body evidence, pending P3.
+    """Who was visibly talking, keyed by the DESCRIPTIVE EPITHET the AV pass is
+    required to use (its prompt forbids real names).
 
-    Today av_notes v2 carries `actions[].who` as an EPITHET ("金发青年"), with no
-    stable anchor id and no mouth state, so it cannot support a family vote yet.
-    Returning zero coverage rather than a plausible-looking empty vote is the
-    point: a family with no observations must be dropped from the merge, and if
-    it were silently scored as "nothing supported this person", missing data
-    would read as evidence against them (§7's one-sided rule).
+    Only `moving` counts as positive. `still` is weak (limited animation loops a
+    closed mouth over a whole second) and `not_visible` / absent coverage are
+    missing data - all three are counted, none of them scores against a candidate,
+    per the one-sided rule. A slot reaches this evidence through `visual_label`,
+    the epithet a human attached to that entity at sign-off: the mapping from
+    "金发青年" to a name is a human judgement, never a string match here.
     """
-    scenes = [n for n in ((av_doc or {}).get("scene_notes") or []) if isinstance(n, dict)] \
+    notes = [n for n in ((av_doc or {}).get("scene_notes") or []) if isinstance(n, dict)] \
         if isinstance(av_doc, dict) else []
-    return {"clips_total": len(scenes), "clips_visual_usable": 0, "clips_positive": 0,
-            "anchors": {}, "available": False,
-            "note": "mouth_state / stable visual anchors land in P3; until then the "
-                    "visual family contributes no votes and cannot satisfy §4.1"}
+    compliance = (av_doc or {}).get("mouth_compliance") if isinstance(av_doc, dict) else None
+    clips_total = clips_usable = clips_positive = 0
+    positive: Dict[str, int] = {}
+    states_seen = {"moving": 0, "still": 0, "not_visible": 0, "unknown": 0}
+    for note in notes:
+        for seg in note.get("segments") or []:
+            actions = ((seg.get("visual") or {}).get("actions") or [])
+            if not actions:
+                continue
+            clips_total += 1
+            usable = any(str(a.get("mouth_state")) in ("moving", "still", "not_visible")
+                         for a in actions)
+            clips_usable += int(usable)
+            if any(str(a.get("mouth_state")) == "moving" for a in actions):
+                clips_positive += 1
+            for action in actions:
+                state = str(action.get("mouth_state") or "unknown")
+                if state in states_seen:
+                    states_seen[state] += 1
+                if state == "moving" and str(action.get("who") or "").strip():
+                    who = str(action["who"]).strip()
+                    positive[who] = positive.get(who, 0) + 1
+    usable_channel = bool(compliance.get("usable")) if isinstance(compliance, dict) else False
+    return {"clips_total": clips_total, "clips_visual_usable": clips_usable,
+            "clips_positive": clips_positive,
+            "anchors": {"positive_by_anchor": positive, "states_seen": states_seen},
+            "available": usable_channel,
+            "note": "visual family is live" if usable_channel else
+                    "mouth_state compliance below the P3 gate (or no v3 notes yet): "
+                    "the visual family contributes no votes and cannot satisfy §4.1"}
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +186,10 @@ def slots_from_approved(approved: Dict[str, Any],
             },
             "status": "approved",
             "entity_id": entity.get("id"),
+            # The descriptive epithet a human mapped to this entity at sign-off.
+            # The AV pass may never output a name, so this field is the only legal
+            # bridge between "金发青年" and an entity.
+            "visual_label": str(entity.get("visual_label") or "").strip() or None,
             # Coverage is per slot: how many clips were usable at all, and how many
             # gave a positive sighting of THIS anchor. Uncovered clips stay in the
             # denominator so "nobody saw them" is visible as a number.
@@ -166,7 +197,7 @@ def slots_from_approved(approved: Dict[str, Any],
                          "clips_visual_usable": visual.get("clips_visual_usable", 0),
                          "clips_positive": int((visual.get("anchors") or {})
                                                .get("positive_by_anchor", {})
-                                               .get(str(entity.get("canonical_name") or ""), 0))},
+                                               .get(str(entity.get("visual_label") or ""), 0))},
             "origin": "approved_table",
         })
     return slots
@@ -181,7 +212,8 @@ def _compatible(known: str, other: str) -> Optional[bool]:
 
 
 def family_support(cluster: Dict[str, Any], slot: Dict[str, Any],
-                   anchors: Dict[str, Any], entity_name: Optional[str]) -> Tuple[List[str], List[str]]:
+                   anchors: Dict[str, Any], entity_name: Optional[str],
+                   anchors_available: bool = True) -> Tuple[List[str], List[str]]:
     """Return (families supporting, reasons). Positive evidence only:
     an absent observation is never a vote for or against."""
     families: List[str] = []
@@ -195,9 +227,11 @@ def family_support(cluster: Dict[str, Any], slot: Dict[str, Any],
         families.append("acoustic")
         reasons.append("acoustic." + ",".join(f"{f}={cluster.get(f)}" for f in known_agree))
 
-    if entity_name and entity_name in anchors.get("positive_by_anchor", {}):
+    label = slot.get("visual_label")
+    positive = anchors.get("positive_by_anchor") or {}
+    if anchors_available and label and positive.get(label):
         families.append("visual")
-        reasons.append(f"visual.mouth={anchors['positive_by_anchor'][entity_name]} clips")
+        reasons.append(f"visual.mouth={positive[label]} clips of {label} talking")
 
     # Deliberately NO text_subtitle support here. An address term says the
     # LISTENER is 茉里, and the cluster being scored just spoke that line, so the
@@ -224,7 +258,8 @@ def match_cluster(cluster_id: str, cluster: Dict[str, Any], slots: List[Dict[str
         entity_name = _entity_name(ev["approved"], entity_by_slot.get(slot["slot_id"]))
         if entity_name and entity_name in (not_speaker.get(cluster_id) or []):
             continue  # this cluster spoke a line addressing them: ruled out, not scored
-        families, reasons = family_support(cluster, slot, anchors, entity_name)
+        families, reasons = family_support(cluster, slot, anchors, entity_name,
+                                            anchors_available=bool(ev["visual"].get("available")))
         if not families:
             continue
         scored.append((len(families) + _exact_attribute_bonus(cluster, slot),
