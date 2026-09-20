@@ -165,9 +165,12 @@ def render_prompt(cast_doc: Dict[str, Any], offset: int = 0
     window = pending[offset:offset + SLOTS_PER_ROUND]
     table = render_table(window)
     remaining = len(pending) - offset - len(window)
+    # The named-count is hoisted out of the f-string: a {...} expression may not
+    # span lines before Python 3.12 (PEP 701), and CI byte-compiles on 3.11.
+    named_count = sum(1 for c in (cast_doc.get('clusters') or [])
+                      if (c.get('assignment') or {}).get('status') == 'approved')
     header = (f"本集识别出 {len((cast_doc.get('clusters') or []))} 个说话人："
-              f"已定名 {sum(1 for c in (cast_doc.get('clusters') or [])
-                            if (c.get('assignment') or {}).get('status') == 'approved')} 个、"
+              f"已定名 {named_count} 个、"
               f"待你定名 {len(pending)} 个。\n\n{table}\n\n"
               + "回话示例：" + _example(window) + "，或整句「"
               + (f"{window[0]['slot_id']} 那个金发的就叫…" if window else "…") + "」")
